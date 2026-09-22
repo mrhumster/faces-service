@@ -24,6 +24,12 @@ spec:
           envFrom:
             - configMapRef:
                 name: faces-service-config
+            - secretRef:
+                name: go-app-secret
+            - secretRef:
+                name: minio-credentials
+            - secretRef:
+                name: faces-internal-token
           resources:
             requests:
               cpu: 200m
