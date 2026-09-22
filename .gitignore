@@ -4,3 +4,8 @@ __pycache__/
 .pytest_cache/
 .env
 deploy/generated/
+
+# 288MB model zip — lives in the build context for --mount=type=bind,
+# never committed.
+models/
+tmp/

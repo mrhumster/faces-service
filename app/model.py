@@ -16,12 +16,16 @@ class FaceModel:
 
     def _load(self) -> None:
         try:
-            from insightface.app import FaceAnalysis
+            # Import the submodule directly: insightface/app/__init__.py pulls
+            # app/mask_renderer.py -> albumentations, which we do not bundle.
+            from insightface.app.face_analysis import FaceAnalysis
         except ImportError as e:  # pragma: no cover
             raise RuntimeError("insightface not installed") from e
 
         root = os.path.abspath(os.path.expanduser(os.getenv("MODELS_ROOT", "/models")))
-        if not os.path.exists(os.path.join(root, "buffalo_l")):
+        # insightface's ensure_available('models', name, root) resolves the pack
+        # to $(MODELS_ROOT)/models/<name> — check the exact dir it will load.
+        if not os.path.exists(os.path.join(root, "models", "buffalo_l")):
             raise RuntimeError(f"buffalo_l model not found under MODELS_ROOT={root}")
         app = FaceAnalysis(
             name="buffalo_l",
@@ -36,7 +40,8 @@ class FaceModel:
         """Return [{embedding: np.ndarray (512,), confidence: float}]."""
         if self._app is None:
             self._load()
-        faces = self._app.get(img, det_thresh=detect_threshold)
+        self._app.det_thresh = detect_threshold
+        faces = self._app.get(img)
         out = []
         for f in faces:
             if f.embedding is None or f.det_score is None:
