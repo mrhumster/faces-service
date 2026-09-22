@@ -42,7 +42,8 @@ RUN python -m venv .venv \
         pydantic==2.10.4 \
         psycopg2-binary==2.9.10 \
         minio==7.2.12 \
-        PyJWT==2.10.1 \
+        PyJWT[crypto]==2.10.1 \
+        cryptography==44.0.0 \
         httpx==0.28.1 \
         prometheus-client==0.21.1 \
     && .venv/bin/pip freeze > /app/installed.txt

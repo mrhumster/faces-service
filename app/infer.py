@@ -40,7 +40,7 @@ class InferEngine:
                 frame_skipped += 1
                 continue
             raw, _ = buf
-            img = decode_img(raw)
+            img = decode_img(raw.getvalue())
             if img is None:
                 frame_skipped += 1
                 continue

@@ -66,7 +66,7 @@ def rename_face(cluster_id: str, body: RenameBody, auth: AuthContext = Depends(_
     except AuthError as e:
         reader_requests.labels(endpoint="rename_face", status=str(e.status)).inc()
         raise HTTPException(status_code=e.status, detail=e.message)
-    name = body.get("name")
+    name = body.name
     err = db.rename_cluster(cluster_id, c["owner_id"], name)
     if err is not None:
         code, msg = err

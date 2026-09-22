@@ -30,13 +30,16 @@ spec:
                 name: minio-credentials
             - secretRef:
                 name: faces-internal-token
+          env:
+            - name: UVICORN_WORKERS
+              value: "1"
           resources:
             requests:
               cpu: 200m
-              memory: 256Mi
+              memory: 512Mi
             limits:
               cpu: "1"
-              memory: 1Gi
+              memory: 2Gi
           readinessProbe:
             httpGet:
               path: /health
