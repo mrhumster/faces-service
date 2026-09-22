@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: faces-service
+  namespace: go-app
+  labels:
+    app: faces-reader
+spec:
+  selector:
+    app: faces-reader
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080

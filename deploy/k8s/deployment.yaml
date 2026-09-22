@@ -1,0 +1,45 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: faces-reader
+  namespace: go-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: faces-reader
+  template:
+    metadata:
+      labels:
+        app: faces-reader
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+        - name: faces-reader
+          image: xomrkob/faces-service:latest
+          imagePullPolicy: Always
+          envFrom:
+            - configMapRef:
+                name: faces-service-config
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 20
+            periodSeconds: 15
