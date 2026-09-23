@@ -46,6 +46,7 @@ RUN python -m venv .venv \
         cryptography==44.0.0 \
         httpx==0.28.1 \
         prometheus-client==0.21.1 \
+        python-multipart==0.0.20 \
     && .venv/bin/pip freeze > /app/installed.txt
 
 # ============================================================
