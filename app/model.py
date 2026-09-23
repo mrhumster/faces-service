@@ -37,7 +37,7 @@ class FaceModel:
         logger.info("insightface buffalo_l loaded from %s", root)
 
     def embed(self, img: np.ndarray, detect_threshold: float) -> list[dict]:
-        """Return [{embedding: np.ndarray (512,), confidence: float}]."""
+        """Return [{embedding: np.ndarray (512,), confidence: float, bbox: [x1,y1,x2,y2] | None}]."""
         if self._app is None:
             self._load()
         self._app.det_thresh = detect_threshold
@@ -51,5 +51,11 @@ class FaceModel:
             if norm == 0 or norm > 100:
                 continue
             emb = emb / norm
-            out.append({"embedding": emb, "confidence": float(f.det_score)})
+            det = {"embedding": emb, "confidence": float(f.det_score)}
+            bbox = getattr(f, "bbox", None)
+            if bbox is not None and len(bbox) == 4:
+                det["bbox"] = [float(v) for v in bbox]
+            else:
+                det["bbox"] = None
+            out.append(det)
         return out

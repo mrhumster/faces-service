@@ -26,3 +26,8 @@ reader_requests = Counter(
     "Reader REST requests",
     ["endpoint", "status"],
 )
+cascade_total = Counter(
+    "faces_cascade_total",
+    "Cascade delete requests",
+    ["status"],
+)

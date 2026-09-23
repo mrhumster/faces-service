@@ -76,7 +76,7 @@ def get_clusters_for_owner(owner_id: str) -> list[dict]:
     with conn() as cur:
         cur.execute(
             """
-            SELECT id, name, is_named, centroid, sample_count, created_at, updated_at
+            SELECT id, name, is_named, centroid, sample_count, crop_object, created_at, updated_at
             FROM clusters
             WHERE owner_id = %s
             ORDER BY is_named DESC, created_at ASC
@@ -93,6 +93,7 @@ def get_clusters_for_owner(owner_id: str) -> list[dict]:
                 "is_named": r["is_named"],
                 "centroid": _from_list_array(r["centroid"]),
                 "sample_count": r["sample_count"],
+                "crop_object": r["crop_object"],
                 "created_at": r["created_at"],
                 "updated_at": r["updated_at"],
             }
@@ -104,7 +105,7 @@ def get_cluster(cluster_id: str, owner_id: str | None = None) -> dict | None:
     with conn() as cur:
         cur.execute(
             """
-            SELECT id, owner_id, name, is_named, centroid, sample_count, created_at, updated_at
+            SELECT id, owner_id, name, is_named, centroid, sample_count, crop_object, created_at, updated_at
             FROM clusters
             WHERE id = %s::uuid
             """,
@@ -122,6 +123,7 @@ def get_cluster(cluster_id: str, owner_id: str | None = None) -> dict | None:
         "is_named": r["is_named"],
         "centroid": _from_list_array(r["centroid"]),
         "sample_count": r["sample_count"],
+        "crop_object": r["crop_object"],
         "created_at": r["created_at"],
         "updated_at": r["updated_at"],
     }
@@ -303,3 +305,67 @@ def update_cluster_centroid(cluster_id: str, owner_id: str, centroid: list[float
             "UPDATE clusters SET centroid = %s::float8[], updated_at = now() WHERE id = %s::uuid AND owner_id = %s",
             (_tolist_array(centroid), cluster_id, owner_id),
         )
+
+
+def set_cluster_crop(cluster_id: str, owner_id: str, crop_object: str | None) -> None:
+    """Point a cluster to its face crop object in MinIO (or clear it)."""
+    with conn() as cur:
+        cur.execute(
+            "UPDATE clusters SET crop_object = %s, updated_at = now() WHERE id = %s::uuid AND owner_id = %s",
+            (crop_object, cluster_id, owner_id),
+        )
+
+
+def cascade_stream(stream_id: str) -> dict:
+    """Permanently delete all faces data for a stream: occurrences plus any
+    clusters orphaned by the removal (sample_count dropping to 0). Returns
+    counts of deleted occurrences/clusters plus the removed clusters
+    ({owner_id, id}) so the caller can also purge their crop images."""
+    deleted_clusters: list[dict] = []
+    with conn() as cur:
+        cur.execute(
+            "SELECT DISTINCT cluster_id FROM face_occurrences WHERE stream_id = %s::uuid",
+            (stream_id,),
+        )
+        cluster_ids = [r[0] for r in cur.fetchall()]
+
+        cur.execute(
+            "DELETE FROM face_occurrences WHERE stream_id = %s::uuid",
+            (stream_id,),
+        )
+        occurrences_deleted = cur.rowcount or 0
+
+        clusters_deleted = 0
+        for cid in cluster_ids:
+            if cid is None:
+                continue
+            cur.execute(
+                "SELECT owner_id FROM clusters WHERE id = %s::uuid",
+                (cid,),
+            )
+            row = cur.fetchone()
+            cur.execute(
+                """
+                UPDATE clusters SET sample_count = (
+                    SELECT count(*) FROM face_occurrences WHERE cluster_id = %s::uuid
+                ), updated_at = now()
+                WHERE id = %s::uuid
+                """,
+                (cid, cid),
+            )
+            cur.execute(
+                "DELETE FROM clusters WHERE id = %s::uuid AND sample_count = 0",
+                (cid,),
+            )
+            if cur.rowcount:
+                clusters_deleted += cur.rowcount
+                if row is not None:
+                    deleted_clusters.append(
+                        {"owner_id": str(row["owner_id"]), "id": str(cid)}
+                    )
+
+    return {
+        "occurrences_deleted": occurrences_deleted,
+        "clusters_deleted": clusters_deleted,
+        "deleted_clusters": deleted_clusters,
+    }

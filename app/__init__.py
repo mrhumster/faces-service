@@ -31,6 +31,7 @@ async def lifespan(app: FastAPI):
         )
     model = FaceModel()
     store = FrameStore()
+    app.state.store = store
     app.state.engine = InferEngine(model=model, store=store)
     logging.getLogger("faces-service").info(
         "faces-service up addr=%s bucket=%s",

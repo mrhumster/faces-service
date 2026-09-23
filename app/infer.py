@@ -33,6 +33,7 @@ class InferEngine:
         faces_detected = 0
         frame_skipped = 0
         created_ids: list[str] = []
+        crops_saved = 0
 
         for idx in range(count):
             buf = self.store.get_frame_io(frames_prefix, idx)
@@ -54,6 +55,7 @@ class InferEngine:
                 cluster_id, sim = match_cluster(
                     emb, clusters, match_threshold, unknown_threshold
                 )
+                need_crop = False
                 if cluster_id is None or cluster_id not in cluster_map:
                     centroid = emb.astype(np.float32)
                     new_id = db.upsert_cluster(owner_id, None, False, centroid.tolist())
@@ -65,11 +67,13 @@ class InferEngine:
                         "is_named": False,
                         "centroid": centroid.tolist(),
                         "sample_count": 0,
+                        "crop_object": None,
                     }
                     clusters.append(nc)
                     cluster_map[new_id] = nc
                     drift[new_id] = centroid.tolist()
                     created_ids.append(new_id)
+                    need_crop = True
                 else:
                     c = cluster_map[cluster_id]
                     centroid = np.asarray(c["centroid"], dtype=np.float32)
@@ -77,6 +81,16 @@ class InferEngine:
                     c["centroid"] = merged.tolist()
                     c["sample_count"] += 1
                     drift[cluster_id] = merged.tolist()
+                    need_crop = c.get("crop_object") is None
+
+                if need_crop and det["bbox"]:
+                    jpeg = self._crop_jpeg(img, det["bbox"])
+                    if jpeg is not None:
+                        key = self.store.put_crop(owner_id, cluster_id, jpeg)
+                        cluster_map[cluster_id]["crop_object"] = key
+                        db.set_cluster_crop(cluster_id, owner_id, key)
+                        crops_saved += 1
+
                 items.append(
                     (cluster_id, emb.astype(np.float32).tolist(), t_seconds, det["confidence"])
                 )
@@ -91,7 +105,30 @@ class InferEngine:
             "frames_skipped": frame_skipped,
             "occurrences_written": written,
             "clusters_created": created_ids,
+            "crops_saved": crops_saved,
         }
+
+    @staticmethod
+    def _crop_jpeg(img: np.ndarray, bbox: list[float]) -> bytes | None:
+        """Crop the face region from the frame (with a small padding margin),
+        encoded as JPEG. Returns None when the box is degenerate."""
+        pad = 0.15
+        h, w = img.shape[:2]
+        x1, y1, x2, y2 = (float(v) for v in bbox)
+        bw, bh = x2 - x1, y2 - y1
+        if bw <= 1 or bh <= 1:
+            return None
+        x1 = max(0, int(x1 - bw * pad))
+        y1 = max(0, int(y1 - bh * pad))
+        x2 = min(w, int(x2 + bw * pad))
+        y2 = min(h, int(y2 + bh * pad))
+        if x2 - x1 < 8 or y2 - y1 < 8:
+            return None
+        crop = img[y1:y2, x1:x2]
+        ok, buf = cv2.imencode(".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        if not ok:
+            return None
+        return buf.tobytes()
 
 
 def decode_img(raw: bytes) -> np.ndarray | None:
