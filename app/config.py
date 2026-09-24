@@ -19,6 +19,7 @@ class Config:
     db_user: str = _env("DB_USER", "postgres")
     db_pass: str = _env("DB_PASS", "")
     db_name: str = _env("DB_NAME", "faces")
+    db_max_conn: int = int(_env("DB_MAX_CONN", "40"))
 
     minio_endpoint: str = _env("MINIO_ENDPOINT", "localhost:9000")
     minio_access_key: str = _env("MINIO_ACCESS_KEY", "admin")
@@ -30,6 +31,8 @@ class Config:
     cors_origins: str = _env("CORS_ALLOW_ORIGINS", "")
 
     internal_token: str = _env("FACES_INTERNAL_TOKEN", "")
+
+    stream_service_url: str = _env("STREAM_SERVICE_URL", "http://stream-service:80")
 
     models_root: str = _env("MODELS_ROOT", "/models")
     match_threshold: float = float(_env("FACES_MATCH_THRESHOLD", "0.4"))

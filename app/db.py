@@ -18,7 +18,7 @@ def init_db() -> None:
             return
         _pool = psycopg2.pool.ThreadedConnectionPool(
             minconn=1,
-            maxconn=8,
+            maxconn=config.Config.db_max_conn,
             host=config.Config.db_host,
             port=config.Config.db_port,
             user=config.Config.db_user,
@@ -286,6 +286,127 @@ def append_stream_occurrences(
             (owner_id, stream_id),
         )
     return written
+
+
+def delete_cluster(cluster_id: str, owner_id: str) -> dict | None:
+    """Permanently delete a cluster owned by owner_id along with all its face
+    occurrences. Returns a dict with the affected stream ids and the removed
+    cluster's crop key, or None when the cluster does not exist or belongs to
+    someone else."""
+    with conn() as cur:
+        cur.execute(
+            "SELECT owner_id, crop_object FROM clusters WHERE id = %s::uuid",
+            (cluster_id,),
+        )
+        row = cur.fetchone()
+        if row is None or str(row["owner_id"]) != owner_id:
+            return None
+
+        cur.execute(
+            "SELECT DISTINCT stream_id FROM face_occurrences WHERE cluster_id = %s::uuid",
+            (cluster_id,),
+        )
+        streams = [str(r[0]) for r in cur.fetchall()]
+
+        cur.execute(
+            "DELETE FROM face_occurrences WHERE cluster_id = %s::uuid",
+            (cluster_id,),
+        )
+        cur.execute("DELETE FROM clusters WHERE id = %s::uuid", (cluster_id,))
+
+        return {
+            "owner_id": str(row["owner_id"]),
+            "crop_object": row["crop_object"],
+            "affected_streams": streams,
+        }
+
+
+def merge_clusters(owner_id: str, target_id: str, source_ids: list[str]) -> dict | None:
+    """Move occurrences of source_ids (all owned by owner_id) into target_id and
+    delete the sources. face_occurrences has a UNIQUE (stream_id, cluster_id,
+    t_seconds) constraint, so colliding timestamps are nudged by a small
+    epsilon when a source and the target already share the same frame.
+    Returns {affected_streams, deleted_cluster_ids} or None on an
+    ownership/missing target error. sample_count is recomputed for the merged
+    cluster."""
+    with conn() as cur:
+        cur.execute(
+            "SELECT owner_id, crop_object FROM clusters WHERE id = %s::uuid",
+            (target_id,),
+        )
+        target = cur.fetchone()
+        if target is None or str(target["owner_id"]) != owner_id:
+            return None
+
+        # verify ownership of every source cluster before mutating
+        for cid in source_ids:
+            cur.execute(
+                "SELECT owner_id FROM clusters WHERE id = %s::uuid",
+                (cid,),
+            )
+            r = cur.fetchone()
+            if r is None or str(r["owner_id"]) != owner_id:
+                return None
+
+        affected: set[str] = set()
+
+        cur.execute(
+            "SELECT DISTINCT stream_id FROM face_occurrences WHERE cluster_id = %s::uuid",
+            (target_id,),
+        )
+        for r in cur.fetchall():
+            affected.add(str(r[0]))
+
+        def occupied(stream_id: str) -> set[float]:
+            cur.execute(
+                "SELECT t_seconds FROM face_occurrences WHERE cluster_id = %s::uuid AND stream_id = %s::uuid",
+                (target_id, stream_id),
+            )
+            return {float(r[0]) for r in cur.fetchall()}
+
+        occ_cache: dict[str, set[float]] = {}
+        for cid in source_ids:
+            cur.execute(
+                "SELECT stream_id, embedding, t_seconds, confidence FROM face_occurrences WHERE cluster_id = %s::uuid",
+                (cid,),
+            )
+            for r in cur.fetchall():
+                stream_id = str(r["stream_id"])
+                affected.add(stream_id)
+                if stream_id not in occ_cache:
+                    occ_cache[stream_id] = occupied(stream_id)
+                t = float(r["t_seconds"])
+                while t in occ_cache[stream_id]:
+                    t += 1e-4
+                occ_cache[stream_id].add(t)
+                cur.execute(
+                    """
+                    INSERT INTO face_occurrences
+                        (owner_id, stream_id, cluster_id, embedding, t_seconds, confidence, created_at)
+                    VALUES (%s, %s::uuid, %s::uuid, %s::float8[], %s, %s, now())
+                    """,
+                    (owner_id, stream_id, target_id, _tolist_array(_from_list_array(r["embedding"])), t, float(r["confidence"])),
+                )
+            cur.execute(
+                "DELETE FROM face_occurrences WHERE cluster_id = %s::uuid",
+                (cid,),
+            )
+            cur.execute("DELETE FROM clusters WHERE id = %s::uuid", (cid,))
+
+        cur.execute(
+            """
+            UPDATE clusters SET sample_count = (
+                SELECT count(*) FROM face_occurrences WHERE cluster_id = clusters.id
+            ), updated_at = now()
+            WHERE id = %s::uuid
+            """,
+            (target_id,),
+        )
+
+        return {
+            "affected_streams": sorted(affected),
+            "deleted_cluster_ids": [cid for cid in source_ids],
+        }
 
 
 def get_stream_owner(stream_id: str) -> str | None:

@@ -1,16 +1,20 @@
 import io
+import logging
 
 import cv2
+import httpx
 import numpy as np
 from fastapi import APIRouter, Depends, File, Header, HTTPException, Request, UploadFile
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
-from .. import db
+from .. import config, db
 from ..auth import AuthContext, AuthError, authorized, ensure_owner
 from ..metrics import reader_requests
 
 router = APIRouter()
+
+logger = logging.getLogger("faces-service")
 
 MAX_CROP_BYTES = 5 * 1024 * 1024
 
@@ -19,8 +23,31 @@ class RenameBody(BaseModel):
     name: str | None = Field(default=None, max_length=120)
 
 
+class MergeBody(BaseModel):
+    cluster_ids: list[str] = Field(min_length=2, max_length=100)
+
+
 def _auth(authorization: str | None = Header(None)) -> AuthContext:
     return authorized(authorization)
+
+
+def _reset_streams_faces(stream_ids: list[str]) -> None:
+    """Best-effort: tell stream-service to clear the faces_detected flag on the
+    affected streams so detection can be re-run after a person is deleted.
+    Does not raise: stream 404s and upstream errors are logged and skipped."""
+    if not config.Config.internal_token:
+        return
+    if not config.Config.stream_service_url:
+        return
+    headers = {"X-Internal-Token": config.Config.internal_token}
+    for stream_id in stream_ids:
+        url = f"{config.Config.stream_service_url.rstrip('/')}/stream/{stream_id}/faces/reset"
+        try:
+            r = httpx.post(url, headers=headers, timeout=3.0)
+            if r.status_code not in (200, 201, 404):
+                logger.warning("reset faces flag failed stream=%s status=%s", stream_id, r.status_code)
+        except Exception as e:
+            logger.warning("reset faces flag error stream=%s: %s", stream_id, e)
 
 
 @router.get("/faces")
@@ -189,3 +216,80 @@ def stream_faces(stream_id: str, auth: AuthContext = Depends(_auth)):
         )
     reader_requests.labels(endpoint="stream_faces", status="200").inc()
     return {"clusters": out}
+
+
+@router.delete("/faces/{cluster_id}")
+def delete_face(cluster_id: str, request: Request, auth: AuthContext = Depends(_auth)):
+    """Delete a person (owner/admin only). Removes the cluster, its occurrences
+    and its crop image, then resets the faces_detected flag on every affected
+    stream so detection can be re-run."""
+    c = db.get_cluster(cluster_id)
+    if c is None:
+        reader_requests.labels(endpoint="delete_face", status="404").inc()
+        raise HTTPException(status_code=404, detail="not found")
+    try:
+        ensure_owner(auth, c["owner_id"])
+    except AuthError as e:
+        reader_requests.labels(endpoint="delete_face", status=str(e.status)).inc()
+        raise HTTPException(status_code=e.status, detail=e.message)
+
+    result = db.delete_cluster(cluster_id, c["owner_id"])
+    if result is None:
+        reader_requests.labels(endpoint="delete_face", status="404").inc()
+        raise HTTPException(status_code=404, detail="not found")
+
+    store = getattr(request.app.state, "store", None)
+    if store is not None and result.get("crop_object"):
+        try:
+            store.delete_crop(result["owner_id"], cluster_id)
+        except Exception as e:
+            logger.warning("crop delete error cluster=%s: %s", cluster_id, e)
+
+    _reset_streams_faces(result.get("affected_streams", []))
+    reader_requests.labels(endpoint="delete_face", status="200").inc()
+    return {"cluster_id": cluster_id}
+
+
+@router.post("/faces/merge")
+def merge_faces(body: MergeBody, request: Request, auth: AuthContext = Depends(_auth)):
+    """Merge several people into one. Occurrences move to the target cluster
+    (the first selected cluster that has a name, otherwise the first one), the
+    source clusters are deleted along with their crops. The faces_detected
+    flag is intentionally left unchanged (detection already ran)."""
+    ids = body.cluster_ids
+    target_id: str | None = None
+    target_owner: str | None = None
+    for cid in ids:
+        c = db.get_cluster(cid)
+        if c is None:
+            reader_requests.labels(endpoint="merge_faces", status="404").inc()
+            raise HTTPException(status_code=404, detail="not found")
+        try:
+            ensure_owner(auth, c["owner_id"])
+        except AuthError as e:
+            reader_requests.labels(endpoint="merge_faces", status=str(e.status)).inc()
+            raise HTTPException(status_code=e.status, detail=e.message)
+        if target_id is None and c["is_named"]:
+            target_id = cid
+            target_owner = c["owner_id"]
+    if target_id is None:
+        target_id = ids[0]
+        target_owner = db.get_cluster(target_id)["owner_id"]
+
+    source_ids = [cid for cid in ids if cid != target_id]
+    result = db.merge_clusters(target_owner, target_id, source_ids)
+    if result is None:
+        reader_requests.labels(endpoint="merge_faces", status="404").inc()
+        raise HTTPException(status_code=404, detail="not found")
+
+    store = getattr(request.app.state, "store", None)
+    if store is not None and result.get("deleted_cluster_ids"):
+        for cid in result["deleted_cluster_ids"]:
+            try:
+                store.delete_crop(target_owner, cid)
+            except Exception as e:
+                logger.warning("crop delete during merge error cluster=%s: %s", cid, e)
+
+    merged = db.get_cluster(target_id, target_owner)
+    reader_requests.labels(endpoint="merge_faces", status="200").inc()
+    return {"cluster": merged, "merged_ids": ids, "target_id": target_id}
