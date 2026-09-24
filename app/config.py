@@ -37,5 +37,5 @@ class Config:
     models_root: str = _env("MODELS_ROOT", "/models")
     match_threshold: float = float(_env("FACES_MATCH_THRESHOLD", "0.4"))
     unknown_threshold: float = float(_env("FACES_UNKNOWN_THRESHOLD", "0.5"))
-    max_frames: int = int(_env("FACES_MAX_FRAMES", "2000"))
+    max_frames: int = int(_env("FACES_MAX_FRAMES", "500"))
     detect_threshold: float = float(_env("FACES_DETECT_THRESHOLD", "0.4"))

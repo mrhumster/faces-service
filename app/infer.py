@@ -10,7 +10,7 @@ from .minio_client import FrameStore
 
 logger = logging.getLogger("faces-service")
 
-SAMPLE_INTERVAL_SECONDS = 3.0
+SAMPLE_INTERVAL_SECONDS = 5.0
 
 
 def _thresholds() -> tuple[float, float]:
