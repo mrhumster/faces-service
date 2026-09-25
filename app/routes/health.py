@@ -9,7 +9,7 @@ router = APIRouter()
 @router.get("/health")
 def health():
     try:
-        db.ping()
+        db.ping_direct()
         return {"status": "up"}
     except Exception:
         return {"status": "down"}

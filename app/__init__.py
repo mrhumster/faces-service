@@ -1,6 +1,8 @@
 import logging
 from contextlib import asynccontextmanager
 
+import anyio
+from psycopg2.pool import PoolError
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -19,6 +21,13 @@ async def lifespan(app: FastAPI):
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    try:
+        limiter = anyio.to_thread.current_default_thread_limiter()
+        limiter.total_tokens = config.Config.reader_threads
+    except Exception as e:
+        logging.getLogger("faces-service").warning(
+            "threadpool resize skipped: %s", e
+        )
     try:
         db.init_db()
     except Exception as e:
@@ -60,6 +69,14 @@ def create_app() -> FastAPI:
     @app.exception_handler(AuthError)
     async def auth_error_handler(request: Request, exc: AuthError):
         return JSONResponse(status_code=exc.status, content={"detail": exc.message})
+
+    @app.exception_handler(PoolError)
+    @app.exception_handler(db.DBBusyError)
+    async def db_busy_handler(request: Request, exc: Exception):
+        logging.getLogger("faces-service").warning(
+            "db busy: %s", exc.__class__.__name__
+        )
+        return JSONResponse(status_code=503, content={"detail": "database busy"})
 
     app.include_router(health.router)
     app.include_router(metrics.router)

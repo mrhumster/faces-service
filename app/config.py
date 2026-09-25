@@ -20,6 +20,8 @@ class Config:
     db_pass: str = _env("DB_PASS", "")
     db_name: str = _env("DB_NAME", "faces")
     db_max_conn: int = int(_env("DB_MAX_CONN", "40"))
+    db_acquire_timeout: float = float(_env("DB_ACQUIRE_TIMEOUT", "5"))
+    reader_threads: int = int(_env("READER_THREADS", "80"))
 
     minio_endpoint: str = _env("MINIO_ENDPOINT", "localhost:9000")
     minio_access_key: str = _env("MINIO_ACCESS_KEY", "admin")

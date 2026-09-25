@@ -2,14 +2,14 @@ import io
 import logging
 
 import cv2
-import httpx
 import numpy as np
-from fastapi import APIRouter, Depends, File, Header, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Header, HTTPException, Query, Request, UploadFile
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
 from .. import config, db
 from ..auth import AuthContext, AuthError, authorized, ensure_owner
+from ..clustering import build_similarity_groups
 from ..metrics import reader_requests
 
 router = APIRouter()
@@ -17,6 +17,8 @@ router = APIRouter()
 logger = logging.getLogger("faces-service")
 
 MAX_CROP_BYTES = 5 * 1024 * 1024
+LIST_FACES_DEFAULT_LIMIT = 50
+LIST_FACES_MAX_LIMIT = 100
 
 
 class RenameBody(BaseModel):
@@ -31,41 +33,107 @@ def _auth(authorization: str | None = Header(None)) -> AuthContext:
     return authorized(authorization)
 
 
-def _reset_streams_faces(stream_ids: list[str]) -> None:
-    """Best-effort: tell stream-service to clear the faces_detected flag on the
-    affected streams so detection can be re-run after a person is deleted.
-    Does not raise: stream 404s and upstream errors are logged and skipped."""
-    if not config.Config.internal_token:
-        return
-    if not config.Config.stream_service_url:
-        return
-    headers = {"X-Internal-Token": config.Config.internal_token}
-    for stream_id in stream_ids:
-        url = f"{config.Config.stream_service_url.rstrip('/')}/stream/{stream_id}/faces/reset"
-        try:
-            r = httpx.post(url, headers=headers, timeout=3.0)
-            if r.status_code not in (200, 201, 404):
-                logger.warning("reset faces flag failed stream=%s status=%s", stream_id, r.status_code)
-        except Exception as e:
-            logger.warning("reset faces flag error stream=%s: %s", stream_id, e)
-
-
 @router.get("/faces")
-def list_faces(auth: AuthContext = Depends(_auth)):
+def list_faces(
+    auth: AuthContext = Depends(_auth),
+    limit: int = Query(default=LIST_FACES_DEFAULT_LIMIT, ge=1, le=LIST_FACES_MAX_LIMIT),
+    offset: int = Query(default=0, ge=0),
+):
+    """People list. Clusters with 0 videos (orphans) are hidden and counted in
+    ``empty_count``; the rest (``clusters``) is paginated by samples. Similarity
+    groups (near-duplicates by centroid cosine >= 0.5) are computed server-side
+    and returned in full on every page; grouped clusters are excluded from the
+    flat list. ``total`` is the number of video-bearing clusters, ``rest_total``
+    the number of non-grouped ones (the pagination bound). Centroid vectors are
+    stripped from list responses to keep the payload small."""
     owner_id = auth.user_id
     clusters = db.get_clusters_for_owner(owner_id)
-    total = db.get_cluster_total_counts(owner_id)
+    videos_by_cluster = db.get_clusters_videos(owner_id)
+
+    def _public(c):
+        d = dict(c)
+        d.pop("centroid", None)
+        return d
+
+    # keep only clusters that appear in at least one video
+    rest = [c for c in clusters if c["id"] in videos_by_cluster]
+    empty_count = len(clusters) - len(rest)
+
+    all_groups = build_similarity_groups([c for c in rest if c.get("centroid")])
+    grouped_ids = {
+        g["rep"]["id"] for g in all_groups
+    } | {m["cluster"]["id"] for g in all_groups for m in g["members"]}
+
+    flat = [c for c in rest if c["id"] not in grouped_ids]
+    flat.sort(
+        key=lambda c: (
+            not c["is_named"],
+            c["name"] is None,
+            c["name"] or "",
+            -c["sample_count"],
+            c["id"],
+        )
+    )
+
+    total = len(rest)
+    rest_total = len(flat)
+    page = flat[offset : offset + limit]
 
     def stats(c):
-        videos = db.get_cluster_videos(c["id"])
+        videos = videos_by_cluster.get(c["id"], [])
         return {
-            **c,
+            **_public(c),
             "video_count": len(videos),
             "videos": videos,
         }
 
+    groups_out = []
+    for g in all_groups:
+        groups_out.append(
+            {
+                "rep": stats(g["rep"]),
+                "members": [
+                    {"cluster": stats(m["cluster"]), "sim": m["sim"]}
+                    for m in g["members"]
+                ],
+                "maxSim": g["maxSim"],
+            }
+        )
+
     reader_requests.labels(endpoint="list_faces", status="200").inc()
-    return {"clusters": [stats(c) for c in clusters], "total": total}
+    return {
+        "clusters": [stats(c) for c in page],
+        "groups": groups_out,
+        "total": total,
+        "empty_count": empty_count,
+        "rest_total": rest_total,
+        "limit": limit,
+        "offset": offset,
+    }
+
+
+@router.post("/faces/delete-empty")
+def delete_empty_faces(request: Request, auth: AuthContext = Depends(_auth)):
+    """Permanently delete clusters that appear in no video (0 samples), purging
+    their crop images too. Idempotent: clusters that gained occurrences between
+    the query and the delete are skipped. Returns the number actually deleted.
+    streams' faces_detected flag is untouched — empty clusters have no
+    occurrences, so no stream needs a detection reset."""
+    rows = db.get_clusters_without_occurrences(auth.user_id)
+    deleted = 0
+    store = getattr(request.app.state, "store", None)
+    for r in rows:
+        result = db.delete_cluster(r["id"], auth.user_id)
+        if result is None:
+            continue
+        deleted += 1
+        if store is not None and result.get("crop_object"):
+            try:
+                store.delete_crop(result["owner_id"], r["id"])
+            except Exception as e:
+                logger.warning("crop delete error cluster=%s: %s", r["id"], e)
+    reader_requests.labels(endpoint="delete_empty_faces", status="200").inc()
+    return {"deleted": deleted}
 
 
 @router.get("/faces/{cluster_id}")
@@ -133,7 +201,11 @@ def face_crop(cluster_id: str, request: Request, auth: AuthContext = Depends(_au
         raise HTTPException(status_code=404, detail="no crop yet")
     content, content_type = data
     reader_requests.labels(endpoint="face_crop", status="200").inc()
-    return Response(content=content, media_type=content_type)
+    return Response(
+        content=content,
+        media_type=content_type,
+        headers={"Cache-Control": "private, max-age=3600"},
+    )
 
 
 @router.put("/faces/{cluster_id}/crop")
@@ -221,8 +293,9 @@ def stream_faces(stream_id: str, auth: AuthContext = Depends(_auth)):
 @router.delete("/faces/{cluster_id}")
 def delete_face(cluster_id: str, request: Request, auth: AuthContext = Depends(_auth)):
     """Delete a person (owner/admin only). Removes the cluster, its occurrences
-    and its crop image, then resets the faces_detected flag on every affected
-    stream so detection can be re-run."""
+    and its crop image. The faces_detected flag is intentionally left unchanged:
+    detection already ran, and deleting a person is curation (unwanted or broken
+    detections), not a signal that detection needs to run again."""
     c = db.get_cluster(cluster_id)
     if c is None:
         reader_requests.labels(endpoint="delete_face", status="404").inc()
@@ -245,7 +318,6 @@ def delete_face(cluster_id: str, request: Request, auth: AuthContext = Depends(_
         except Exception as e:
             logger.warning("crop delete error cluster=%s: %s", cluster_id, e)
 
-    _reset_streams_faces(result.get("affected_streams", []))
     reader_requests.labels(endpoint="delete_face", status="200").inc()
     return {"cluster_id": cluster_id}
 

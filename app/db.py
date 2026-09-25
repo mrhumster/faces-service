@@ -9,6 +9,16 @@ from . import config
 
 _pool: psycopg2.pool.ThreadedConnectionPool | None = None
 _lock = threading.Lock()
+# psycopg2's ThreadedConnectionPool raises PoolError when maxconn is reached
+# instead of queueing. A BoundedSemaphore converts exhaustion into waiting so a
+# burst of concurrent requests (e.g. lazy face crops) degrades to latency, not
+# unhandled 500s.
+_slots = threading.BoundedSemaphore(config.Config.db_max_conn)
+
+
+class DBBusyError(Exception):
+    """Raised when no database connection slot is available within
+    db_acquire_timeout seconds."""
 
 
 def init_db() -> None:
@@ -40,7 +50,13 @@ def conn():
     init_db()
     if _pool is None:
         raise RuntimeError("db pool not initialized")
-    c = _pool.getconn()
+    if not _slots.acquire(timeout=config.Config.db_acquire_timeout):
+        raise DBBusyError("no database connection slot available")
+    try:
+        c = _pool.getconn()
+    except Exception:
+        _slots.release()
+        raise
     try:
         with c.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
             yield cur
@@ -50,11 +66,26 @@ def conn():
         raise
     finally:
         _pool.putconn(c)
+        _slots.release()
 
 
 def ping() -> None:
     with conn() as cur:
         cur.execute("SELECT 1")
+
+
+def ping_direct() -> None:
+    """Health-check without touching the shared pool: a short-lived dedicated
+    connection (connect_timeout=1) so readiness/liveness probes stay green even
+    while the pool is saturated by a burst."""
+    psycopg2.connect(
+        host=config.Config.db_host,
+        port=config.Config.db_port,
+        user=config.Config.db_user,
+        password=config.Config.db_pass,
+        dbname=config.Config.db_name,
+        connect_timeout=1,
+    ).close()
 
 
 def _tolist_array(a: list[float]) -> str:
@@ -149,6 +180,52 @@ def get_cluster_videos(cluster_id: str) -> list[dict]:
         )
         return [
             {"stream_id": str(r["stream_id"]), "count": int(r["n"])} for r in cur.fetchall()
+        ]
+
+
+def get_clusters_videos(owner_id: str) -> dict[str, list[dict]]:
+    """Batch video-count per cluster for an owner (one query instead of N+1)."""
+    with conn() as cur:
+        cur.execute(
+            """
+            SELECT o.cluster_id, o.stream_id, count(*) AS n
+            FROM face_occurrences o
+            JOIN clusters c ON c.id = o.cluster_id
+            WHERE c.owner_id = %s
+            GROUP BY o.cluster_id, o.stream_id
+            ORDER BY o.cluster_id, n DESC
+            """,
+            (owner_id,),
+        )
+        out: dict[str, list[dict]] = {}
+        for r in cur.fetchall():
+            out.setdefault(str(r["cluster_id"]), []).append(
+                {"stream_id": str(r["stream_id"]), "count": int(r["n"])}
+            )
+        return out
+
+
+def get_clusters_without_occurrences(owner_id: str) -> list[dict]:
+    """Clusters that appear in no video (orphans with 0 samples)."""
+    with conn() as cur:
+        cur.execute(
+            """
+            SELECT c.id, c.owner_id, c.crop_object
+            FROM clusters c
+            LEFT JOIN face_occurrences o ON o.cluster_id = c.id
+            WHERE c.owner_id = %s
+            GROUP BY c.id
+            HAVING count(o.id) = 0
+            """,
+            (owner_id,),
+        )
+        return [
+            {
+                "id": str(r["id"]),
+                "owner_id": str(r["owner_id"]),
+                "crop_object": r["crop_object"],
+            }
+            for r in cur.fetchall()
         ]
 
 
