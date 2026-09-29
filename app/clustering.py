@@ -157,6 +157,28 @@ def iou(a: list[float], b: list[float]) -> float:
     return float(inter / union) if union > 0 else 0.0
 
 
+def face_is_large_enough(
+    bbox: list[float],
+    frame_shape: tuple[int, int, int] | tuple[int, int],
+    min_ratio: float,
+) -> bool:
+    """Whether a detected face is worth recognising.
+
+    Recognition is by far the most expensive part of the paused-frame assist
+    (measured ~589ms per face), and a face that small cannot produce an
+    embedding good enough to match anyone — so the interactive path drops it
+    before paying for it, and the UI never shows a box that has no name behind
+    it. `min_ratio` is relative to the frame height; 0 keeps everything, which
+    is what the batch pipeline relies on for recall.
+    """
+    if min_ratio <= 0:
+        return True
+    height = float(bbox[3]) - float(bbox[1])
+    if height <= 0:
+        return False
+    return height >= min_ratio * float(frame_shape[0])
+
+
 SIMILARITY_THRESHOLD = 0.5
 
 

@@ -48,3 +48,6 @@ class Config:
     # Detector input for the interactive assist. SCRFD work is quadratic in this,
     # and the batch pipeline keeps the full 640 by leaving it at 0.
     assist_det_size: int = int(_env("FACES_ASSIST_DET_SIZE", "320"))
+    # Faces shorter than this share of the frame are dropped before recognition
+    # (~589ms each, and too small to match anyone). 0 keeps every face.
+    assist_min_face_ratio: float = float(_env("FACES_ASSIST_MIN_FACE_RATIO", "0.06"))

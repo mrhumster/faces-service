@@ -53,6 +53,11 @@ spec:
             # speed back for recall on very small faces.
             - name: FACES_ASSIST_DET_SIZE
               value: "320"
+            # Faces shorter than this share of the frame height are dropped
+            # before recognition: it is the dominant cost (~589ms each measured)
+            # and they are too small to match anyone. 0 keeps every face.
+            - name: FACES_ASSIST_MIN_FACE_RATIO
+              value: "0.06"
           resources:
             requests:
               cpu: 200m

@@ -324,3 +324,42 @@ def test_cache_serves_a_fresh_index_after_a_write():
     cache.bump("owner")
     matrix, meta = cache.get("owner", builder)
     assert meta[0]["name"] == "Alice"
+
+
+# --- interactive face size floor ----------------------------------------------
+# Recognition dominates the assist cost, so faces too small to match are dropped
+# before it. The filter is checked relative to frame height, in raw pixels.
+
+
+def test_face_floor_disabled_keeps_everything():
+    box = [0.0, 0.0, 10.0, 3.0]
+    assert clustering.face_is_large_enough(box, (405, 720, 3), 0.0)
+    assert clustering.face_is_large_enough(box, (405, 720, 3), -1.0)
+
+
+def test_face_floor_drops_small_faces():
+    # 12px tall out of 405 = ~3%, below the 6% floor
+    assert not clustering.face_is_large_enough([0.0, 0.0, 12.0, 12.0], (405, 720, 3), 0.06)
+    # 30px tall out of 405 = ~7.4%, kept
+    assert clustering.face_is_large_enough([0.0, 0.0, 20.0, 30.0], (405, 720, 3), 0.06)
+
+
+def test_face_floor_boundary_is_inclusive():
+    assert clustering.face_is_large_enough([0.0, 0.0, 10.0, 24.3], (405, 720, 3), 0.06)
+    assert not clustering.face_is_large_enough([0.0, 0.0, 10.0, 24.2], (405, 720, 3), 0.06)
+
+
+def test_face_floor_uses_height_not_position():
+    # a face low in the frame is judged the same as one at the top
+    tall = [0.0, 300.0, 20.0, 340.0]   # 40px tall, near the bottom
+    assert clustering.face_is_large_enough(tall, (405, 720, 3), 0.06)
+
+
+def test_face_floor_rejects_degenerate_box():
+    assert not clustering.face_is_large_enough([0.0, 50.0, 10.0, 50.0], (405, 720, 3), 0.06)
+
+
+def test_face_floor_scales_with_frame_height():
+    # same pixel height, taller frame -> smaller share -> dropped
+    assert clustering.face_is_large_enough([0.0, 0.0, 10.0, 40.0], (405, 720, 3), 0.06)
+    assert not clustering.face_is_large_enough([0.0, 0.0, 10.0, 40.0], (2160, 3840, 3), 0.06)
