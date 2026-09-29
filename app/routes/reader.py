@@ -263,7 +263,9 @@ async def detect_faces(
     index_ms = (time.perf_counter() - started) * 1000
 
     with _INFER_SEMAPHORE:
-        detections = engine.model.embed(img, config.Config.detect_threshold)
+        detections = engine.model.embed(
+            img, config.Config.detect_threshold, config.Config.assist_det_size
+        )
     infer_ms = (time.perf_counter() - started) * 1000 - index_ms
 
     height, width = img.shape[:2]
@@ -291,9 +293,10 @@ async def detect_faces(
 
     took_ms = (time.perf_counter() - started) * 1000
     logger.info(
-        "detect frame faces=%d clusters=%d index=%.0fms infer=%.0fms total=%.0fms",
+        "detect frame faces=%d clusters=%d det=%d index=%.0fms infer=%.0fms total=%.0fms",
         len(faces),
         len(meta),
+        config.Config.assist_det_size,
         index_ms,
         infer_ms,
         took_ms,
@@ -359,7 +362,11 @@ async def attach_frame_face(
         cluster = None
 
     with _INFER_SEMAPHORE:
-        detections = engine.model.embed(img, config.Config.detect_threshold)
+        # same detector size as /faces/detect, so the box the client echoes back
+        # was produced at the same resolution we are about to re-detect at
+        detections = engine.model.embed(
+            img, config.Config.detect_threshold, config.Config.assist_det_size
+        )
 
     target = None
     best_iou = 0.0

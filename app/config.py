@@ -45,3 +45,6 @@ class Config:
     # this similarity is trusted enough to attach silently, below it the user is
     # asked. A suggestion floor of unknown_threshold decides "candidate at all".
     assist_auto_threshold: float = float(_env("FACES_ASSIST_AUTO_THRESHOLD", "0.9"))
+    # Detector input for the interactive assist. SCRFD work is quadratic in this,
+    # and the batch pipeline keeps the full 640 by leaving it at 0.
+    assist_det_size: int = int(_env("FACES_ASSIST_DET_SIZE", "320"))

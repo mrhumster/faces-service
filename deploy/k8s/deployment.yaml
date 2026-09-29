@@ -42,6 +42,12 @@ spec:
               value: "2"
             - name: MKL_NUM_THREADS
               value: "2"
+            # Detector input for the interactive paused-frame assist. SCRFD cost is
+            # quadratic in this: 320 answers in ~0.4s what 640 needed ~1.5s for.
+            # The batch pipeline does not read this. Set to 640 (or 0) to trade
+            # speed back for recall on very small faces.
+            - name: FACES_ASSIST_DET_SIZE
+              value: "320"
           resources:
             requests:
               cpu: 200m
