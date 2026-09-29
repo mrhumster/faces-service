@@ -1,4 +1,5 @@
 import logging
+import time
 
 import numpy as np
 
@@ -43,31 +44,101 @@ def merge_centroid(existing: np.ndarray, count: int, new: np.ndarray) -> np.ndar
     return ((existing * count) + new) / (count + 1)
 
 
-def pick_suggestion(
-    embedding: np.ndarray,
-    clusters: list[dict],
-    floor: float,
-) -> tuple[dict | None, float]:
-    """Best cluster for a face the user just paused on, ignoring match/unknown
-    thresholds: the point of the interactive assist is to *offer* a candidate and
-    let a human decide, so the only gate is `floor` (how similar is too far to
-    even mention).
+def build_suggestion_index(clusters: list[dict]) -> tuple[np.ndarray, list[dict]]:
+    """Stack cluster centroids into one L2-normalized matrix so that matching a
+    face becomes a single matrix-vector product.
 
-    Returns (cluster | None, similarity). None means "no candidate worth showing" —
-    the caller then offers to create a new person. Whether a candidate is strong
-    enough to attach silently is the caller's call (it needs the config threshold).
+    Rebuilding this per paused frame is what made the interactive assist slow:
+    with a few thousand people the centroid list is megabytes and a per-cluster
+    Python loop dominated the request. The matrix is built once and reused, so
+    this is only paid on the (rare) invalidation.
     """
-    best: dict | None = None
-    best_sim = 0.0
+    vectors: list[np.ndarray] = []
+    meta: list[dict] = []
     for c in clusters:
         centroid = c.get("centroid")
         if not centroid:
             continue
-        sim = cosine_similarity(embedding, np.asarray(centroid, dtype=np.float32))
-        if sim >= floor and (best is None or sim > best_sim):
-            best = c
-            best_sim = sim
-    return best, best_sim
+        vectors.append(np.asarray(centroid, dtype=np.float32))
+        meta.append(c)
+    if not vectors:
+        return np.zeros((0, 0), dtype=np.float32), []
+    matrix = np.stack(vectors).astype(np.float32)
+    norms = np.linalg.norm(matrix, axis=1)
+    norms[norms == 0] = 1.0
+    return matrix / norms[:, None], meta
+
+
+def best_match(
+    matrix: np.ndarray,
+    meta: list[dict],
+    embedding: np.ndarray,
+    floor: float,
+) -> tuple[dict | None, float]:
+    """Nearest cluster to a face the user just paused on, ignoring the batch
+    match/unknown thresholds: the assist is meant to *offer* a candidate and let
+    a human decide, so the only gate is `floor` (how similar is too far to even
+    mention).
+
+    Returns (cluster | None, similarity). None means "no candidate worth showing"
+    — the caller then offers to create a new person. Whether a candidate is
+    strong enough to attach silently is the caller's call (it needs the config
+    threshold).
+    """
+    if matrix.size == 0:
+        return None, 0.0
+    query = np.asarray(embedding, dtype=np.float32)
+    norm = float(np.linalg.norm(query))
+    if norm == 0:
+        return None, 0.0
+    sims = matrix @ (query / norm)
+    index = int(np.argmax(sims))
+    similarity = float(sims[index])
+    if similarity < floor:
+        return None, similarity
+    return meta[index], similarity
+
+
+class SuggestionIndexCache:
+    """Per-owner cache of the suggestion index.
+
+    Entries are dropped by `bump(owner_id)` from every write path, so a fresh
+    read is the normal case and the TTL is only a backstop against a write path
+    that forgets to bump. The TTL is deliberately generous: a cold build costs
+    about two seconds for a large library, so a short one would rebuild constantly.
+    """
+
+    def __init__(self, ttl_seconds: float = 300.0) -> None:
+        self._ttl = ttl_seconds
+        self._entries: dict[str, tuple[int, float, tuple[np.ndarray, list[dict]]]] = {}
+        self._epoch: dict[str, int] = {}
+        self._clock = time.monotonic
+
+    def epoch(self, owner_id: str) -> int:
+        return self._epoch.get(owner_id, 0)
+
+    def bump(self, owner_id: str) -> None:
+        """Drop the owner's index; the next read rebuilds it."""
+        self._epoch[owner_id] = self.epoch(owner_id) + 1
+        self._entries.pop(owner_id, None)
+
+    def get(self, owner_id: str, builder) -> tuple[np.ndarray, list[dict]]:
+        epoch = self.epoch(owner_id)
+        entry = self._entries.get(owner_id)
+        if entry is not None:
+            stored_epoch, stored_at, value = entry
+            if stored_epoch == epoch and (self._clock() - stored_at) < self._ttl:
+                return value
+        value = builder()
+        self._entries[owner_id] = (epoch, self._clock(), value)
+        return value
+
+    def clear(self) -> None:
+        self._entries.clear()
+
+
+# Shared by the reader routes and every write path in db.py.
+SUGGESTION_INDEX = SuggestionIndexCache()
 
 
 def iou(a: list[float], b: list[float]) -> float:

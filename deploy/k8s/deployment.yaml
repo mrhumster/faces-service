@@ -33,6 +33,15 @@ spec:
           env:
             - name: UVICORN_WORKERS
               value: "1"
+            # onnxruntime sizes its thread pool from the node's core count (4)
+            # while the cgroup only grants this pod 1 CPU, so bursts stalled for
+            # a whole 100ms period (throttled ~93ms per hit). Pin the pools to
+            # the quota. The CPU limit is deliberately left alone: raising it
+            # would take cores away from the rest of the node.
+            - name: OMP_NUM_THREADS
+              value: "2"
+            - name: MKL_NUM_THREADS
+              value: "2"
           resources:
             requests:
               cpu: 200m

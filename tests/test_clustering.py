@@ -146,9 +146,12 @@ def test_build_similarity_groups_no_group_for_two_unrelated():
     ]
     assert clustering.build_similarity_groups(clusters, 0.5) == []
 
+
 # --- interactive frame assist -------------------------------------------------
 # The paused-frame assist must *offer* the nearest identity even when it is below
-# match/unknown thresholds, and must stay silent when nothing is close enough.
+# the batch match/unknown thresholds, and must stay silent when nothing is close.
+# Matching runs against a prebuilt matrix, so these also pin the index/meta
+# alignment: a suggestion must come back with the cluster it was scored against.
 
 
 def _unit(vec):
@@ -156,48 +159,66 @@ def _unit(vec):
     return v / np.linalg.norm(v)
 
 
-def test_pick_suggestion_offers_below_match_threshold():
-    # 0.45 similarity: below match_threshold (0.4 is passed, so use a lower sim)
-    emb = _unit([1.0, 0.45, 0.0])
-    clusters = [
-        _cluster("far", [0.0, 1.0, 0.0], is_named=True),
-    ]
-    best, sim = clustering.pick_suggestion(emb, clusters, 0.4)
+def _match(clusters, embedding, floor=0.5):
+    matrix, meta = clustering.build_suggestion_index(clusters)
+    return clustering.best_match(matrix, meta, embedding, floor)
+
+
+def test_best_match_offers_below_batch_thresholds():
+    # 0.45 similarity: too weak for a silent attach, still worth showing
+    best, sim = _match([_cluster("far", [0.0, 1.0, 0.0], is_named=True)], _unit([1.0, 0.45, 0.0]), floor=0.4)
     assert best is not None and best["id"] == "far"
-    # floor decides candidacy, not the batch match_threshold
     assert 0.4 <= sim < 0.5
 
 
-def test_pick_suggestion_respects_floor():
-    emb = _unit([1.0, 0.0, 0.0])
-    clusters = [_cluster("orthogonal", [0.0, 1.0, 0.0], is_named=True)]
-    best, sim = clustering.pick_suggestion(emb, clusters, 0.5)
+def test_best_match_respects_floor():
+    best, sim = _match([_cluster("orthogonal", [0.0, 1.0, 0.0], is_named=True)], _unit([1.0, 0.0, 0.0]), floor=0.5)
     assert best is None
     assert sim < 0.5
 
 
-def test_pick_suggestion_picks_the_closest():
-    emb = _unit([1.0, 0.2, 0.0])
+def test_best_match_picks_the_closest_and_returns_its_own_cluster():
     clusters = [
         _cluster("a", [0.0, 1.0, 0.0]),
         _cluster("b", [1.0, 0.0, 0.0]),
         _cluster("c", [1.0, 0.25, 0.0]),
     ]
-    best, sim = clustering.pick_suggestion(emb, clusters, 0.5)
+    best, sim = _match(clusters, _unit([1.0, 0.2, 0.0]))
     assert best["id"] == "c"
     assert sim > 0.9
 
 
-def test_pick_suggestion_skips_clusters_without_centroid():
-    emb = _unit([1.0, 0.0, 0.0])
-    clusters = [{"id": "x", "centroid": None, "is_named": True}]
-    best, _ = clustering.pick_suggestion(emb, clusters, 0.5)
-    assert best is None
+def test_best_match_similarities_match_cosine():
+    clusters = [_cluster("a", [1.0, 0.0, 0.0]), _cluster("b", [0.0, 1.0, 0.0])]
+    emb = _unit([0.8, 0.6, 0.0])
+    _, sim = _match(clusters, emb, floor=0.0)
+    assert abs(sim - clustering.cosine_similarity(emb, _unit([1.0, 0.0, 0.0]))) < 1e-5
 
 
-def test_pick_suggestion_empty_owner():
-    best, sim = clustering.pick_suggestion(_unit([1.0, 0.0, 0.0]), [], 0.5)
+def test_build_index_skips_clusters_without_centroid():
+    matrix, meta = clustering.build_suggestion_index(
+        [{"id": "x", "centroid": None, "is_named": True}, _cluster("y", [1.0, 0.0, 0.0])]
+    )
+    assert matrix.shape == (1, 3)
+    assert [c["id"] for c in meta] == ["y"]
+
+
+def test_build_index_empty():
+    matrix, meta = clustering.build_suggestion_index([])
+    assert matrix.size == 0 and meta == []
+    best, sim = clustering.best_match(matrix, meta, _unit([1.0, 0.0, 0.0]), 0.5)
     assert best is None and sim == 0.0
+
+
+def test_best_match_handles_zero_query():
+    matrix, meta = clustering.build_suggestion_index([_cluster("a", [1.0, 0.0, 0.0])])
+    best, sim = clustering.best_match(matrix, meta, np.zeros(3, dtype=np.float32), 0.5)
+    assert best is None and sim == 0.0
+
+
+def test_best_match_tolerates_zero_centroid():
+    _, sim = _match([_cluster("z", [0.0, 0.0, 0.0])], _unit([1.0, 0.0, 0.0]), floor=0.0)
+    assert sim == 0.0  # a zero centroid must not produce a NaN match
 
 
 def test_iou_identical_and_disjoint():
@@ -216,3 +237,90 @@ def test_iou_half_overlap():
 def test_iou_touching_edges_is_zero():
     # the detector and the client can disagree by a pixel; a shared edge is no hit
     assert clustering.iou([0.0, 0.0, 10.0, 10.0], [10.0, 0.0, 20.0, 10.0]) == 0.0
+
+
+# --- suggestion index cache ---------------------------------------------------
+
+
+def test_cache_builds_once_and_reuses():
+    cache = clustering.SuggestionIndexCache(ttl_seconds=300.0)
+    calls = []
+
+    def builder():
+        calls.append(1)
+        return clustering.build_suggestion_index([_cluster("a", [1.0, 0.0, 0.0])])
+
+    first = cache.get("owner", builder)
+    second = cache.get("owner", builder)
+    assert len(calls) == 1
+    assert first is second
+
+
+def test_cache_bump_forces_a_rebuild():
+    cache = clustering.SuggestionIndexCache(ttl_seconds=300.0)
+    calls = []
+
+    def builder():
+        calls.append(1)
+        return clustering.build_suggestion_index([_cluster("a", [1.0, 0.0, 0.0])])
+
+    cache.get("owner", builder)
+    cache.bump("owner")
+    cache.get("owner", builder)
+    assert len(calls) == 2
+
+
+def test_cache_bump_is_per_owner():
+    cache = clustering.SuggestionIndexCache(ttl_seconds=300.0)
+    calls = []
+
+    def builder_a():
+        calls.append("a")
+        return clustering.build_suggestion_index([_cluster("a", [1.0, 0.0, 0.0])])
+
+    def builder_b():
+        calls.append("b")
+        return clustering.build_suggestion_index([_cluster("b", [0.0, 1.0, 0.0])])
+
+    cache.get("a", builder_a)
+    cache.get("b", builder_b)
+    cache.bump("a")
+    cache.get("a", builder_a)  # a rebuilt
+    cache.get("b", builder_b)  # b untouched
+    assert calls == ["a", "b", "a"]
+
+
+def test_cache_expires_after_ttl():
+    now = [1000.0]
+    cache = clustering.SuggestionIndexCache(ttl_seconds=10.0)
+    cache._clock = lambda: now[0]  # deterministic clock
+    calls = []
+
+    def builder():
+        calls.append(1)
+        return clustering.build_suggestion_index([_cluster("a", [1.0, 0.0, 0.0])])
+
+    cache.get("owner", builder)
+    now[0] += 9.0
+    cache.get("owner", builder)
+    assert len(calls) == 1
+    now[0] += 2.0  # past the TTL
+    cache.get("owner", builder)
+    assert len(calls) == 2
+
+
+def test_cache_serves_a_fresh_index_after_a_write():
+    # the shape db.py relies on: bump then get must not hand back the old matrix
+    cache = clustering.SuggestionIndexCache(ttl_seconds=300.0)
+    state = {"clusters": [_cluster("a", [1.0, 0.0, 0.0])]}
+
+    def builder():
+        return clustering.build_suggestion_index(state["clusters"])
+
+    matrix, meta = cache.get("owner", builder)
+    assert meta[0]["id"] == "a"
+    # simulate a rename reaching the index
+    state["clusters"] = [_cluster("a", [1.0, 0.0, 0.0], name="Alice", is_named=True)]
+    cache.bump("owner")
+    matrix, meta = cache.get("owner", builder)
+    assert meta[0]["name"] == "Alice"

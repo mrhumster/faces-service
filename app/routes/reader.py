@@ -1,6 +1,7 @@
 import io
 import logging
 import threading
+import time
 
 import cv2
 import numpy as np
@@ -10,7 +11,14 @@ from pydantic import BaseModel, Field
 
 from .. import config, db
 from ..auth import AuthContext, AuthError, authorized, ensure_owner
-from ..clustering import build_similarity_groups, iou, merge_centroid, pick_suggestion
+from ..clustering import (
+    SUGGESTION_INDEX,
+    best_match,
+    build_suggestion_index,
+    build_similarity_groups,
+    iou,
+    merge_centroid,
+)
 from ..metrics import reader_requests
 
 router = APIRouter()
@@ -238,16 +246,25 @@ async def detect_faces(
     similarity is below `unknown_threshold` gets no suggestion at all — the
     client then offers to create a new person instead.
     """
+    started = time.perf_counter()
     img = await _read_image(request, file, "detect_frame")
     engine = _engine_or_503(request, "detect_frame")
 
     owner_id = auth.user_id
-    clusters = db.get_clusters_for_owner(owner_id)
     auto_threshold = config.Config.assist_auto_threshold
     floor = config.Config.unknown_threshold
 
+    # The centroid index is cached per owner: loading every cluster on every
+    # pause cost ~2s for a library of a few thousand people, which dominated the
+    # whole request. Writes drop the owner's entry, so this is a fresh read.
+    matrix, meta = SUGGESTION_INDEX.get(
+        owner_id, lambda: build_suggestion_index(db.get_clusters_for_owner(owner_id))
+    )
+    index_ms = (time.perf_counter() - started) * 1000
+
     with _INFER_SEMAPHORE:
         detections = engine.model.embed(img, config.Config.detect_threshold)
+    infer_ms = (time.perf_counter() - started) * 1000 - index_ms
 
     height, width = img.shape[:2]
     faces = []
@@ -255,7 +272,7 @@ async def detect_faces(
         bbox = det.get("bbox")
         if not bbox:
             continue
-        cluster, sim = pick_suggestion(det["embedding"], clusters, floor)
+        cluster, sim = best_match(matrix, meta, det["embedding"], floor)
         suggestion = None
         if cluster is not None:
             suggestion = {
@@ -272,8 +289,22 @@ async def detect_faces(
             }
         )
 
+    took_ms = (time.perf_counter() - started) * 1000
+    logger.info(
+        "detect frame faces=%d clusters=%d index=%.0fms infer=%.0fms total=%.0fms",
+        len(faces),
+        len(meta),
+        index_ms,
+        infer_ms,
+        took_ms,
+    )
     reader_requests.labels(endpoint="detect_frame", status="200").inc()
-    return {"faces": faces, "width": int(width), "height": int(height)}
+    return {
+        "faces": faces,
+        "width": int(width),
+        "height": int(height),
+        "took_ms": round(took_ms, 1),
+    }
 
 
 @router.post("/streams/{stream_id}/faces/attach")

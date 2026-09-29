@@ -6,6 +6,7 @@ import psycopg2.extras
 import psycopg2.pool
 
 from . import config
+from .clustering import SUGGESTION_INDEX
 
 _pool: psycopg2.pool.ThreadedConnectionPool | None = None
 _lock = threading.Lock()
@@ -339,7 +340,8 @@ def rename_cluster(
             "UPDATE clusters SET name = %s, is_named = %s, updated_at = now() WHERE id = %s::uuid",
             (name, name is not None, cluster_id),
         )
-        return None
+    SUGGESTION_INDEX.bump(owner_id)
+    return None
 
 
 def upsert_cluster(owner_id: str, name: str | None, is_named: bool, centroid: list[float]) -> str:
@@ -352,8 +354,9 @@ def upsert_cluster(owner_id: str, name: str | None, is_named: bool, centroid: li
             """,
             (owner_id, name, is_named, _tolist_array(centroid)),
         )
-        cluster_id = cur.fetchone()[0]
-        return str(cluster_id)
+        cluster_id = str(cur.fetchone()[0])
+    SUGGESTION_INDEX.bump(owner_id)
+    return cluster_id
 
 
 def append_stream_occurrences(
@@ -395,6 +398,7 @@ def append_stream_occurrences(
             """,
             (owner_id, stream_id),
         )
+    SUGGESTION_INDEX.bump(owner_id)
     return written
 
 
@@ -424,11 +428,13 @@ def delete_cluster(cluster_id: str, owner_id: str) -> dict | None:
         )
         cur.execute("DELETE FROM clusters WHERE id = %s::uuid", (cluster_id,))
 
-        return {
+        result = {
             "owner_id": str(row["owner_id"]),
             "crop_object": row["crop_object"],
             "affected_streams": streams,
         }
+    SUGGESTION_INDEX.bump(owner_id)
+    return result
 
 
 def detach_cluster_from_stream(
@@ -483,13 +489,15 @@ def detach_cluster_from_stream(
             r = cur.fetchone()
             sample_count = int(r["sample_count"]) if r else 0
 
-        return {
+        summary = {
             "cluster_id": cluster_id,
             "removed": removed,
             "sample_count": sample_count,
             "cluster_deleted": cluster_deleted,
             "crop_object": row["crop_object"] if cluster_deleted else None,
         }
+    SUGGESTION_INDEX.bump(owner_id)
+    return summary
 
 
 def merge_clusters(owner_id: str, target_id: str, source_ids: list[str]) -> dict | None:
@@ -574,11 +582,12 @@ def merge_clusters(owner_id: str, target_id: str, source_ids: list[str]) -> dict
             (target_id,),
         )
 
-        return {
+        merged = {
             "affected_streams": sorted(affected),
             "deleted_cluster_ids": [cid for cid in source_ids],
         }
-
+    SUGGESTION_INDEX.bump(owner_id)
+    return merged
 
 def get_stream_owner(stream_id: str) -> str | None:
     """Looks up the stream owner from the faces DB index if present."""
@@ -597,6 +606,7 @@ def update_cluster_centroid(cluster_id: str, owner_id: str, centroid: list[float
             "UPDATE clusters SET centroid = %s::float8[], updated_at = now() WHERE id = %s::uuid AND owner_id = %s",
             (_tolist_array(centroid), cluster_id, owner_id),
         )
+    SUGGESTION_INDEX.bump(owner_id)
 
 
 def set_cluster_crop(cluster_id: str, owner_id: str, crop_object: str | None) -> None:
@@ -614,6 +624,7 @@ def cascade_stream(stream_id: str) -> dict:
     counts of deleted occurrences/clusters plus the removed clusters
     ({owner_id, id}) so the caller can also purge their crop images."""
     deleted_clusters: list[dict] = []
+    touched_owners: set[str] = set()
     with conn() as cur:
         cur.execute(
             "SELECT DISTINCT cluster_id FROM face_occurrences WHERE stream_id = %s::uuid",
@@ -636,6 +647,8 @@ def cascade_stream(stream_id: str) -> dict:
                 (cid,),
             )
             row = cur.fetchone()
+            if row is not None:
+                touched_owners.add(str(row["owner_id"]))
             cur.execute(
                 """
                 UPDATE clusters SET sample_count = (
@@ -655,6 +668,9 @@ def cascade_stream(stream_id: str) -> dict:
                     deleted_clusters.append(
                         {"owner_id": str(row["owner_id"]), "id": str(cid)}
                     )
+
+    for owner in touched_owners:
+        SUGGESTION_INDEX.bump(owner)
 
     return {
         "occurrences_deleted": occurrences_deleted,
