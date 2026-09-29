@@ -145,3 +145,74 @@ def test_build_similarity_groups_no_group_for_two_unrelated():
         _cluster("b", [0.0, 1.0, 0.0]),
     ]
     assert clustering.build_similarity_groups(clusters, 0.5) == []
+
+# --- interactive frame assist -------------------------------------------------
+# The paused-frame assist must *offer* the nearest identity even when it is below
+# match/unknown thresholds, and must stay silent when nothing is close enough.
+
+
+def _unit(vec):
+    v = np.asarray(vec, dtype=np.float32)
+    return v / np.linalg.norm(v)
+
+
+def test_pick_suggestion_offers_below_match_threshold():
+    # 0.45 similarity: below match_threshold (0.4 is passed, so use a lower sim)
+    emb = _unit([1.0, 0.45, 0.0])
+    clusters = [
+        _cluster("far", [0.0, 1.0, 0.0], is_named=True),
+    ]
+    best, sim = clustering.pick_suggestion(emb, clusters, 0.4)
+    assert best is not None and best["id"] == "far"
+    # floor decides candidacy, not the batch match_threshold
+    assert 0.4 <= sim < 0.5
+
+
+def test_pick_suggestion_respects_floor():
+    emb = _unit([1.0, 0.0, 0.0])
+    clusters = [_cluster("orthogonal", [0.0, 1.0, 0.0], is_named=True)]
+    best, sim = clustering.pick_suggestion(emb, clusters, 0.5)
+    assert best is None
+    assert sim < 0.5
+
+
+def test_pick_suggestion_picks_the_closest():
+    emb = _unit([1.0, 0.2, 0.0])
+    clusters = [
+        _cluster("a", [0.0, 1.0, 0.0]),
+        _cluster("b", [1.0, 0.0, 0.0]),
+        _cluster("c", [1.0, 0.25, 0.0]),
+    ]
+    best, sim = clustering.pick_suggestion(emb, clusters, 0.5)
+    assert best["id"] == "c"
+    assert sim > 0.9
+
+
+def test_pick_suggestion_skips_clusters_without_centroid():
+    emb = _unit([1.0, 0.0, 0.0])
+    clusters = [{"id": "x", "centroid": None, "is_named": True}]
+    best, _ = clustering.pick_suggestion(emb, clusters, 0.5)
+    assert best is None
+
+
+def test_pick_suggestion_empty_owner():
+    best, sim = clustering.pick_suggestion(_unit([1.0, 0.0, 0.0]), [], 0.5)
+    assert best is None and sim == 0.0
+
+
+def test_iou_identical_and_disjoint():
+    box = [10.0, 10.0, 50.0, 50.0]
+    assert abs(clustering.iou(box, box) - 1.0) < 1e-9
+    assert clustering.iou(box, [100.0, 100.0, 120.0, 120.0]) == 0.0
+
+
+def test_iou_half_overlap():
+    a = [0.0, 0.0, 10.0, 10.0]
+    b = [5.0, 0.0, 15.0, 10.0]
+    # intersection 50, union 150
+    assert abs(clustering.iou(a, b) - 50.0 / 150.0) < 1e-9
+
+
+def test_iou_touching_edges_is_zero():
+    # the detector and the client can disagree by a pixel; a shared edge is no hit
+    assert clustering.iou([0.0, 0.0, 10.0, 10.0], [10.0, 0.0, 20.0, 10.0]) == 0.0

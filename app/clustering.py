@@ -43,6 +43,49 @@ def merge_centroid(existing: np.ndarray, count: int, new: np.ndarray) -> np.ndar
     return ((existing * count) + new) / (count + 1)
 
 
+def pick_suggestion(
+    embedding: np.ndarray,
+    clusters: list[dict],
+    floor: float,
+) -> tuple[dict | None, float]:
+    """Best cluster for a face the user just paused on, ignoring match/unknown
+    thresholds: the point of the interactive assist is to *offer* a candidate and
+    let a human decide, so the only gate is `floor` (how similar is too far to
+    even mention).
+
+    Returns (cluster | None, similarity). None means "no candidate worth showing" —
+    the caller then offers to create a new person. Whether a candidate is strong
+    enough to attach silently is the caller's call (it needs the config threshold).
+    """
+    best: dict | None = None
+    best_sim = 0.0
+    for c in clusters:
+        centroid = c.get("centroid")
+        if not centroid:
+            continue
+        sim = cosine_similarity(embedding, np.asarray(centroid, dtype=np.float32))
+        if sim >= floor and (best is None or sim > best_sim):
+            best = c
+            best_sim = sim
+    return best, best_sim
+
+
+def iou(a: list[float], b: list[float]) -> float:
+    """Intersection-over-union of two [x1, y1, x2, y2] boxes."""
+    ax1, ay1, ax2, ay2 = (float(v) for v in a)
+    bx1, by1, bx2, by2 = (float(v) for v in b)
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+    inter = iw * ih
+    if inter <= 0:
+        return 0.0
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    union = area_a + area_b - inter
+    return float(inter / union) if union > 0 else 0.0
+
+
 SIMILARITY_THRESHOLD = 0.5
 
 

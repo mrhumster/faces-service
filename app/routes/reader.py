@@ -1,15 +1,16 @@
 import io
 import logging
+import threading
 
 import cv2
 import numpy as np
-from fastapi import APIRouter, Depends, File, Header, HTTPException, Query, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
 from .. import config, db
 from ..auth import AuthContext, AuthError, authorized, ensure_owner
-from ..clustering import build_similarity_groups
+from ..clustering import build_similarity_groups, iou, merge_centroid, pick_suggestion
 from ..metrics import reader_requests
 
 router = APIRouter()
@@ -27,6 +28,10 @@ class RenameBody(BaseModel):
 
 class MergeBody(BaseModel):
     cluster_ids: list[str] = Field(min_length=2, max_length=100)
+
+
+class BatchDeleteBody(BaseModel):
+    cluster_ids: list[str] = Field(min_length=1, max_length=100)
 
 
 def _auth(authorization: str | None = Header(None)) -> AuthContext:
@@ -134,6 +139,246 @@ def delete_empty_faces(request: Request, auth: AuthContext = Depends(_auth)):
                 logger.warning("crop delete error cluster=%s: %s", r["id"], e)
     reader_requests.labels(endpoint="delete_empty_faces", status="200").inc()
     return {"deleted": deleted}
+
+
+@router.post("/faces/delete-batch")
+def delete_faces_batch(
+    body: BatchDeleteBody,
+    request: Request,
+    auth: AuthContext = Depends(_auth),
+):
+    """Permanently delete the given face clusters (their occurrences are removed
+    via cascade). Idempotent via dedupe: unknown/foreign cluster ids are skipped
+    silently. Returns the number actually deleted. streams' faces_detected flag
+    is untouched — deleting persons is curation of an already-run detection."""
+    deleted = 0
+    store = getattr(request.app.state, "store", None)
+    for cid in dict.fromkeys(body.cluster_ids):
+        result = db.delete_cluster(cid, auth.user_id)
+        if result is None:
+            continue
+        deleted += 1
+        if store is not None and result.get("crop_object"):
+            try:
+                store.delete_crop(result["owner_id"], cid)
+            except Exception as e:
+                logger.warning("crop delete error cluster=%s: %s", cid, e)
+    reader_requests.labels(endpoint="delete_batch_faces", status="200").inc()
+    return {"deleted": deleted}
+
+
+@router.get("/faces/suggest")
+def suggest_faces(
+    auth: AuthContext = Depends(_auth),
+    q: str = Query(min_length=3, max_length=120),
+    exclude: str | None = Query(default=None, max_length=120),
+):
+    """Name-prefix suggestions for the rename editor: named clusters of the
+    owner whose name starts with ``q`` (case-insensitive, literal). The person
+    currently being renamed can be excluded by id. Lightweight payload (no
+    centroid/videos)."""
+    owner_id = auth.user_id
+    clusters = db.search_named_clusters(owner_id, q.strip())
+    if exclude:
+        clusters = [c for c in clusters if c["id"] != exclude]
+    reader_requests.labels(endpoint="suggest", status="200").inc()
+    return {"clusters": clusters}
+
+
+# The interactive frame assist runs insightface inside the reader process, whose
+# thread pool is shared with every other reader endpoint. Without a cap a paused
+# player (or a scrubbing user) can pile up CPU-heavy inference runs.
+_INFER_SEMAPHORE = threading.BoundedSemaphore(2)
+
+
+def _engine_or_503(request: Request, endpoint: str):
+    engine = getattr(request.app.state, "engine", None)
+    if engine is None:
+        reader_requests.labels(endpoint=endpoint, status="503").inc()
+        raise HTTPException(status_code=503, detail="engine not ready")
+    return engine
+
+
+def _public_cluster(c: dict) -> dict:
+    """Cluster without the 512-float centroid / videos — the overlay only needs
+    enough to render a name and to attach on confirm."""
+    return {
+        "id": str(c["id"]),
+        "name": c.get("name"),
+        "is_named": bool(c.get("is_named")),
+        "sample_count": int(c.get("sample_count") or 0),
+        "crop_object": c.get("crop_object"),
+    }
+
+
+async def _read_image(request: Request, file: UploadFile, endpoint: str) -> np.ndarray:
+    raw = await file.read(MAX_CROP_BYTES + 1)
+    if len(raw) > MAX_CROP_BYTES:
+        reader_requests.labels(endpoint=endpoint, status="413").inc()
+        raise HTTPException(status_code=413, detail="file too large")
+    img = _decode_image(raw)
+    if img is None:
+        reader_requests.labels(endpoint=endpoint, status="400").inc()
+        raise HTTPException(status_code=400, detail="invalid image")
+    return img
+
+
+@router.post("/faces/detect")
+async def detect_faces(
+    request: Request,
+    file: UploadFile = File(...),
+    auth: AuthContext = Depends(_auth),
+):
+    """Detect the faces in a single frame the owner paused on and offer a
+    cluster per face.
+
+    The client grabs the paused frame from the <video> element (canvas -> JPEG)
+    and posts it here; we run the same detector/recognizer the batch pipeline
+    uses, then match every face against the owner's clusters. A face whose best
+    similarity is below `unknown_threshold` gets no suggestion at all — the
+    client then offers to create a new person instead.
+    """
+    img = await _read_image(request, file, "detect_frame")
+    engine = _engine_or_503(request, "detect_frame")
+
+    owner_id = auth.user_id
+    clusters = db.get_clusters_for_owner(owner_id)
+    auto_threshold = config.Config.assist_auto_threshold
+    floor = config.Config.unknown_threshold
+
+    with _INFER_SEMAPHORE:
+        detections = engine.model.embed(img, config.Config.detect_threshold)
+
+    height, width = img.shape[:2]
+    faces = []
+    for det in detections:
+        bbox = det.get("bbox")
+        if not bbox:
+            continue
+        cluster, sim = pick_suggestion(det["embedding"], clusters, floor)
+        suggestion = None
+        if cluster is not None:
+            suggestion = {
+                **_public_cluster(cluster),
+                "similarity": round(float(sim), 4),
+                # strong enough to attach without asking the user
+                "auto": bool(sim >= auto_threshold),
+            }
+        faces.append(
+            {
+                "bbox": [float(v) for v in bbox],
+                "confidence": float(det["confidence"]),
+                "suggestion": suggestion,
+            }
+        )
+
+    reader_requests.labels(endpoint="detect_frame", status="200").inc()
+    return {"faces": faces, "width": int(width), "height": int(height)}
+
+
+@router.post("/streams/{stream_id}/faces/attach")
+async def attach_frame_face(
+    stream_id: str,
+    request: Request,
+    file: UploadFile = File(...),
+    bbox: str = Form(...),
+    t_seconds: float = Form(...),
+    cluster_id: str | None = Form(default=None),
+    auth: AuthContext = Depends(_auth),
+):
+    """Attach the paused frame's face to a cluster (owner/admin only).
+
+    Takes the whole frame plus the bbox the client drew, not a pre-cropped face:
+    the detector is re-run server-side and the embedding is taken from the box
+    that matches, so the client never supplies its own vector (and a tight crop
+    that the detector cannot re-detect still works).
+
+    `cluster_id` empty -> create a new anonymous cluster first, exactly like the
+    batch pipeline does. The occurrence is deduped by
+    (stream_id, cluster_id, t_seconds), so re-pausing on the same second is a
+    no-op rather than a duplicate sample.
+    """
+    img = await _read_image(request, file, "attach_frame_face")
+    engine = _engine_or_503(request, "attach_frame_face")
+
+    try:
+        box = [float(v) for v in bbox.split(",")]
+    except ValueError:
+        reader_requests.labels(endpoint="attach_frame_face", status="400").inc()
+        raise HTTPException(status_code=400, detail="bbox must be x1,y1,x2,y2")
+    if len(box) != 4 or not all(v == v for v in box) or box[2] <= box[0] or box[3] <= box[1]:
+        reader_requests.labels(endpoint="attach_frame_face", status="400").inc()
+        raise HTTPException(status_code=400, detail="bbox must be x1,y1,x2,y2")
+    if not (t_seconds >= 0) or t_seconds != t_seconds or t_seconds == float("inf"):
+        reader_requests.labels(endpoint="attach_frame_face", status="400").inc()
+        raise HTTPException(status_code=400, detail="t_seconds out of range")
+
+    created = False
+    if cluster_id:
+        cluster = db.get_cluster(cluster_id)
+        if cluster is None:
+            reader_requests.labels(endpoint="attach_frame_face", status="404").inc()
+            raise HTTPException(status_code=404, detail="not found")
+        try:
+            ensure_owner(auth, str(cluster["owner_id"]))
+        except AuthError as e:
+            reader_requests.labels(endpoint="attach_frame_face", status=str(e.status)).inc()
+            raise HTTPException(status_code=e.status, detail=e.message)
+    else:
+        cluster = None
+
+    with _INFER_SEMAPHORE:
+        detections = engine.model.embed(img, config.Config.detect_threshold)
+
+    target = None
+    best_iou = 0.0
+    for det in detections:
+        det_box = det.get("bbox")
+        if not det_box:
+            continue
+        score = iou(det_box, box)
+        if score > best_iou:
+            best_iou = score
+            target = det
+    if target is None or best_iou < 0.5:
+        reader_requests.labels(endpoint="attach_frame_face", status="409").inc()
+        raise HTTPException(status_code=409, detail="face not found in the given box")
+
+    embedding = target["embedding"]
+    centroid = np.asarray(embedding, dtype=np.float32)
+    owner_id = auth.user_id if cluster is None else str(cluster["owner_id"])
+
+    if cluster is None:
+        new_id = db.upsert_cluster(owner_id, None, False, centroid.tolist())
+        created = True
+        cluster = db.get_cluster(new_id, owner_id)
+    cluster_id = str(cluster["id"])
+
+    written = db.append_stream_occurrences(
+        owner_id,
+        stream_id,
+        [(cluster_id, centroid.tolist(), t_seconds, float(target["confidence"]))],
+    )
+    # keep the identity centroid fresh, same running mean as the batch path
+    previous = np.asarray(cluster["centroid"], dtype=np.float32)
+    merged = merge_centroid(previous, int(cluster["sample_count"] or 0), centroid)
+    db.update_cluster_centroid(cluster_id, owner_id, merged.tolist())
+
+    if not cluster.get("crop_object") and target.get("bbox"):
+        jpeg = engine._crop_jpeg(img, list(target["bbox"]))
+        store = getattr(request.app.state, "store", None)
+        if jpeg is not None and store is not None:
+            key = store.put_crop(owner_id, cluster_id, jpeg)
+            db.set_cluster_crop(cluster_id, owner_id, key)
+
+    updated = db.get_cluster(cluster_id, owner_id)
+    reader_requests.labels(endpoint="attach_frame_face", status="200").inc()
+    return {
+        "cluster": updated,
+        "created": created,
+        "written": written,
+        "t_seconds": t_seconds,
+    }
 
 
 @router.get("/faces/{cluster_id}")
@@ -288,6 +533,50 @@ def stream_faces(stream_id: str, auth: AuthContext = Depends(_auth)):
         )
     reader_requests.labels(endpoint="stream_faces", status="200").inc()
     return {"clusters": out}
+
+
+@router.delete("/streams/{stream_id}/faces/{cluster_id}")
+def detach_stream_face(
+    stream_id: str,
+    cluster_id: str,
+    request: Request,
+    auth: AuthContext = Depends(_auth),
+):
+    """Remove the association between a person and one of their videos: the
+    cluster's occurrences in this stream are deleted. If the cluster then has
+    no occurrences in any stream it is deleted entirely (along with its crop).
+    The faces_detected flag is intentionally left unchanged: this is curation
+    (like delete/merge), not a signal to re-run detection."""
+    c = db.get_cluster(cluster_id)
+    if c is None:
+        reader_requests.labels(endpoint="detach_stream_face", status="404").inc()
+        raise HTTPException(status_code=404, detail="not found")
+    try:
+        ensure_owner(auth, c["owner_id"])
+    except AuthError as e:
+        reader_requests.labels(endpoint="detach_stream_face", status=str(e.status)).inc()
+        raise HTTPException(status_code=e.status, detail=e.message)
+
+    result = db.detach_cluster_from_stream(cluster_id, stream_id, c["owner_id"])
+    if result is None:
+        reader_requests.labels(endpoint="detach_stream_face", status="404").inc()
+        raise HTTPException(status_code=404, detail="not found")
+
+    store = getattr(request.app.state, "store", None)
+    if store is not None and result.get("crop_object"):
+        try:
+            store.delete_crop(c["owner_id"], cluster_id)
+        except Exception as e:
+            logger.warning("crop delete during detach error cluster=%s: %s", cluster_id, e)
+
+    reader_requests.labels(endpoint="detach_stream_face", status="200").inc()
+    return {
+        "cluster_id": cluster_id,
+        "stream_id": stream_id,
+        "removed": result["removed"],
+        "sample_count": result["sample_count"],
+        "cluster_deleted": result["cluster_deleted"],
+    }
 
 
 @router.delete("/faces/{cluster_id}")

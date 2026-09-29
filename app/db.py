@@ -103,6 +103,39 @@ def _from_list_array(s) -> list[float]:
     return [float(v) for v in body.split(",")]
 
 
+def _escape_like(prefix: str) -> str:
+    return prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def search_named_clusters(owner_id: str, prefix: str, limit: int = 10) -> list[dict]:
+    """Named clusters of the owner whose name starts with ``prefix``
+    (case-insensitive). Wildcards in the prefix are escaped so user input is
+    matched literally."""
+    pattern = f"{_escape_like(prefix)}%"
+    with conn() as cur:
+        cur.execute(
+            """
+            SELECT id, name, is_named, sample_count, crop_object
+            FROM clusters
+            WHERE owner_id = %s AND is_named AND name ILIKE %s ESCAPE '\\'
+            ORDER BY name
+            LIMIT %s
+            """,
+            (owner_id, pattern, limit),
+        )
+        rows = cur.fetchall()
+    return [
+        {
+            "id": str(r["id"]),
+            "name": r["name"],
+            "is_named": r["is_named"],
+            "sample_count": r["sample_count"],
+            "crop_object": r["crop_object"],
+        }
+        for r in rows
+    ]
+
+
 def get_clusters_for_owner(owner_id: str) -> list[dict]:
     with conn() as cur:
         cur.execute(
@@ -395,6 +428,67 @@ def delete_cluster(cluster_id: str, owner_id: str) -> dict | None:
             "owner_id": str(row["owner_id"]),
             "crop_object": row["crop_object"],
             "affected_streams": streams,
+        }
+
+
+def detach_cluster_from_stream(
+    cluster_id: str, stream_id: str, owner_id: str
+) -> dict | None:
+    """Remove the association between a person and one of their streams: delete
+    the face occurrences linking cluster_id to stream_id. If the cluster keeps
+    no occurrences in any stream afterwards (sample_count 0) it is deleted
+    entirely (mirrors cascade_stream). Returns a summary dict, or None when the
+    cluster does not exist or belongs to someone else."""
+    with conn() as cur:
+        cur.execute(
+            "SELECT owner_id, crop_object FROM clusters WHERE id = %s::uuid",
+            (cluster_id,),
+        )
+        row = cur.fetchone()
+        if row is None or str(row["owner_id"]) != owner_id:
+            return None
+
+        cur.execute(
+            """
+            DELETE FROM face_occurrences
+            WHERE cluster_id = %s::uuid AND stream_id = %s::uuid AND owner_id = %s
+            """,
+            (cluster_id, stream_id, owner_id),
+        )
+        removed = cur.rowcount or 0
+
+        cur.execute(
+            """
+            UPDATE clusters SET sample_count = (
+                SELECT count(*) FROM face_occurrences WHERE cluster_id = clusters.id
+            ), updated_at = now()
+            WHERE id = %s::uuid AND owner_id = %s
+            """,
+            (cluster_id, owner_id),
+        )
+
+        cur.execute(
+            "DELETE FROM clusters WHERE id = %s::uuid AND owner_id = %s AND sample_count = 0",
+            (cluster_id, owner_id),
+        )
+        cluster_deleted = cur.rowcount > 0
+
+        if cluster_deleted:
+            sample_count = 0
+        else:
+            cur.execute(
+                "SELECT sample_count FROM clusters WHERE id = %s::uuid AND owner_id = %s",
+                (cluster_id, owner_id),
+            )
+            r = cur.fetchone()
+            sample_count = int(r["sample_count"]) if r else 0
+
+        return {
+            "cluster_id": cluster_id,
+            "removed": removed,
+            "sample_count": sample_count,
+            "cluster_deleted": cluster_deleted,
+            "crop_object": row["crop_object"] if cluster_deleted else None,
         }
 
 

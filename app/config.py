@@ -41,3 +41,7 @@ class Config:
     unknown_threshold: float = float(_env("FACES_UNKNOWN_THRESHOLD", "0.5"))
     max_frames: int = int(_env("FACES_MAX_FRAMES", "500"))
     detect_threshold: float = float(_env("FACES_DETECT_THRESHOLD", "0.4"))
+    # Interactive frame assist (owner pauses the player): a suggestion at or above
+    # this similarity is trusted enough to attach silently, below it the user is
+    # asked. A suggestion floor of unknown_threshold decides "candidate at all".
+    assist_auto_threshold: float = float(_env("FACES_ASSIST_AUTO_THRESHOLD", "0.9"))
