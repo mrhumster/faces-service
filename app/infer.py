@@ -1,4 +1,5 @@
 import logging
+import math
 
 import cv2
 import numpy as np
@@ -13,6 +14,21 @@ logger = logging.getLogger("faces-service")
 SAMPLE_INTERVAL_SECONDS = 5.0
 
 
+def frame_indices(count: int, max_frames: int = 0) -> list[int]:
+    """Frame indexes to process, subsampled uniformly across the whole video.
+
+    `max_frames` caps the work: a recording longer than `max_frames` sampling
+    intervals keeps coverage of its full duration, unlike a prefix cut which
+    would drop the tail entirely. Without a cap every frame is processed.
+    """
+    if count <= 0:
+        return []
+    if max_frames <= 0 or count <= max_frames:
+        return list(range(count))
+    stride = math.ceil(count / max_frames)
+    return list(range(0, count, stride))
+
+
 def _thresholds() -> tuple[float, float]:
     return (config.Config.match_threshold, config.Config.unknown_threshold)
 
@@ -22,9 +38,29 @@ class InferEngine:
         self.model = model
         self.store = store
 
-    def run(self, stream_id: str, owner_id: str, frames_prefix: str, count: int) -> dict:
+    def run(
+        self,
+        stream_id: str,
+        owner_id: str,
+        frames_prefix: str,
+        count: int,
+        max_frames: int = 0,
+    ) -> dict:
         """Reads `count` frames from MinIO under frames_prefix, runs face detection/
-        embedding per frame and clusters into this owner's clusters."""
+        embedding per frame and clusters into this owner's clusters.
+
+        `max_frames` caps the work: frames are sampled uniformly across the whole
+        video rather than only its first `max_frames` frames."""
+        indices = frame_indices(count, max_frames)
+        sampled_out = count - len(indices)
+        if sampled_out > 0:
+            slog.info(
+                "frame subsampling applied",
+                stream_id=stream_id,
+                frames=count,
+                processed=len(indices),
+                max_frames=max_frames,
+            )
         clusters = db.get_clusters_for_owner(owner_id)
         cluster_map: dict[str, dict] = {c["id"]: c for c in clusters}
         drift: dict[str, list[float]] = {}  # cluster_id -> updated centroid
@@ -35,7 +71,7 @@ class InferEngine:
         created_ids: list[str] = []
         crops_saved = 0
 
-        for idx in range(count):
+        for idx in indices:
             buf = self.store.get_frame_io(frames_prefix, idx)
             if buf is None:
                 frame_skipped += 1
@@ -101,8 +137,9 @@ class InferEngine:
 
         return {
             "faces_detected": faces_detected,
-            "frames_processed": count - frame_skipped,
+            "frames_processed": len(indices) - frame_skipped,
             "frames_skipped": frame_skipped,
+            "frames_sampled_out": sampled_out,
             "occurrences_written": written,
             "clusters_created": created_ids,
             "crops_saved": crops_saved,

@@ -23,9 +23,11 @@ def infer(body: InferRequest, request: Request, x_internal_token: str | None = H
         infer_total.labels(status=str(e.status)).inc()
         raise HTTPException(status_code=e.status, detail=e.message)
 
-    if not (0 < body.count <= config.Config.max_frames):
+    # max_frames caps the work, not the request: a long recording is subsampled
+    # uniformly across its whole duration instead of being rejected.
+    if body.count <= 0:
         infer_total.labels(status="400").inc()
-        raise HTTPException(status_code=400, detail="count out of range")
+        raise HTTPException(status_code=400, detail="count must be positive")
 
     engine = getattr(request.app.state, "engine", None)
     if engine is None:
@@ -33,7 +35,13 @@ def infer(body: InferRequest, request: Request, x_internal_token: str | None = H
         raise HTTPException(status_code=503, detail="engine not ready")
 
     with infer_duration.time():
-        result = engine.run(body.stream_id, body.owner_id, body.frames_prefix, body.count)
+        result = engine.run(
+            body.stream_id,
+            body.owner_id,
+            body.frames_prefix,
+            body.count,
+            config.Config.max_frames,
+        )
     infer_faces_detected.inc(result["faces_detected"])
     infer_occurrences_written.inc(result["occurrences_written"])
     infer_total.labels(status="200").inc()
