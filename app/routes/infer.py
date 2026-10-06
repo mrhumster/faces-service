@@ -1,3 +1,8 @@
+import asyncio
+import threading
+from functools import partial
+
+import anyio.to_thread
 from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -9,6 +14,21 @@ from ..metrics import cascade_total, infer_duration, infer_faces_detected, infer
 
 router = APIRouter()
 
+DISCONNECT_POLL_SECONDS = 5.0
+
+
+async def _watch_disconnect(request: Request, stop: threading.Event) -> None:
+    """Set `stop` once the caller hangs up.
+
+    is_disconnected() is async, so it cannot be polled from the synchronous
+    inference loop; this watcher lives on the event loop and flips an event the
+    worker thread checks between frames."""
+    while not stop.is_set():
+        if await request.is_disconnected():
+            stop.set()
+            return
+        await asyncio.sleep(DISCONNECT_POLL_SECONDS)
+
 
 class InferRequest(BaseModel):
     stream_id: str
@@ -18,7 +38,7 @@ class InferRequest(BaseModel):
 
 
 @router.post("/infer")
-def infer(body: InferRequest, request: Request, x_internal_token: str | None = Header(None)):
+async def infer(body: InferRequest, request: Request, x_internal_token: str | None = Header(None)):
     try:
         internal_token(x_internal_token)
     except AuthError as e:
@@ -36,23 +56,32 @@ def infer(body: InferRequest, request: Request, x_internal_token: str | None = H
         infer_total.labels(status="503").inc()
         raise HTTPException(status_code=503, detail="engine not ready")
 
-    with infer_duration.time():
-        try:
-            result = engine.run(
-                body.stream_id,
-                body.owner_id,
-                body.frames_prefix,
-                body.count,
-                config.Config.max_frames,
-                cancel=request.is_disconnected,
-            )
-        except InferenceAborted as aborted:
-            # The worker already gave up; there is nobody left to answer.
-            infer_total.labels(status="499").inc()
-            return JSONResponse(
-                status_code=499,
-                content={"detail": "client gone", "frames_done": aborted.frames_done},
-            )
+    stop = threading.Event()
+    watcher = asyncio.create_task(_watch_disconnect(request, stop))
+    try:
+        with infer_duration.time():
+            try:
+                result = await anyio.to_thread.run_sync(
+                    partial(
+                        engine.run,
+                        body.stream_id,
+                        body.owner_id,
+                        body.frames_prefix,
+                        body.count,
+                        config.Config.max_frames,
+                        cancel=stop.is_set,
+                    )
+                )
+            except InferenceAborted as aborted:
+                # The worker already gave up; there is nobody left to answer.
+                infer_total.labels(status="499").inc()
+                return JSONResponse(
+                    status_code=499,
+                    content={"detail": "client gone", "frames_done": aborted.frames_done},
+                )
+    finally:
+        stop.set()
+        watcher.cancel()
     infer_faces_detected.inc(result["faces_detected"])
     infer_occurrences_written.inc(result["occurrences_written"])
     infer_total.labels(status="200").inc()
