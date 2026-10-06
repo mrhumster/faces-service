@@ -1,7 +1,6 @@
 from fastapi import APIRouter
 
 from .. import db
-from ..metrics import reader_requests
 
 router = APIRouter()
 

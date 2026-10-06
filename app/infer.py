@@ -54,12 +54,9 @@ class InferEngine:
         indices = frame_indices(count, max_frames)
         sampled_out = count - len(indices)
         if sampled_out > 0:
-            slog.info(
-                "frame subsampling applied",
-                stream_id=stream_id,
-                frames=count,
-                processed=len(indices),
-                max_frames=max_frames,
+            logger.info(
+                "frame subsampling applied stream_id=%s frames=%d sampled=%d max_frames=%d",
+                stream_id, count, len(indices), max_frames,
             )
         clusters = db.get_clusters_for_owner(owner_id)
         cluster_map: dict[str, dict] = {c["id"]: c for c in clusters}
