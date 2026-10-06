@@ -1,10 +1,38 @@
-"""Subsampling helper: pure stdlib, no cv2/insightface needed."""
+"""Subsampling and cancellation: stubs only, no cv2/insightface/MinIO needed."""
 import sys
 import os
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app.infer import frame_indices  # noqa: E402
+from app import infer as inf  # noqa: E402
+from app.infer import InferenceAborted, frame_indices  # noqa: E402
+
+
+class _Store:
+    """Every frame is missing, so run() walks the whole index list cheaply."""
+
+    def __init__(self):
+        self.seen: list[int] = []
+
+    def get_frame_io(self, prefix, idx):
+        self.seen.append(idx)
+        return None
+
+
+def _engine(store):
+    engine = inf.InferEngine.__new__(inf.InferEngine)
+    engine.store = store
+    engine.model = None  # never reached: no frame ever decodes
+    return engine
+
+
+@pytest.fixture(autouse=True)
+def _no_db(monkeypatch):
+    monkeypatch.setattr(inf.db, "get_clusters_for_owner", lambda owner: [])
+    monkeypatch.setattr(inf.db, "append_stream_occurrences", lambda owner, sid, items: 0)
+    monkeypatch.setattr(inf.db, "update_cluster_centroid", lambda cid, owner, c: None)
 
 
 class TestFrameIndices:
@@ -43,3 +71,56 @@ class TestFrameIndices:
         # 5000 frames under the same cap needs a coarser stride
         assert len(frame_indices(5000, 500)) <= 500
         assert len(frame_indices(1000, 500)) <= 500
+
+class TestRunSampling:
+    """run() must survive the sampling branch end to end: a NameError there used
+    to surface as a 500 on every long video."""
+
+    def test_samples_and_reports(self):
+        store = _Store()
+        result = _engine(store).run("s1", "owner-1", "faces/s1", 690, 500)
+
+        assert len(store.seen) == 345
+        assert store.seen[0] == 0 and store.seen[-1] == 688
+        assert result["frames_sampled_out"] == 345
+        assert result["frames_processed"] == 0
+        assert result["frames_skipped"] == 345
+
+    def test_no_sampling_keeps_every_frame(self):
+        store = _Store()
+        result = _engine(store).run("s2", "owner-1", "faces/s2", 30, 500)
+
+        assert store.seen == list(range(30))
+        assert result["frames_sampled_out"] == 0
+
+
+class TestRunCancellation:
+    def test_aborts_before_any_work(self):
+        store = _Store()
+        with pytest.raises(InferenceAborted) as exc:
+            _engine(store).run("s3", "owner-1", "faces/s3", 690, 500, cancel=lambda: True)
+
+        assert exc.value.frames_done == 0
+        assert store.seen == []
+
+    def test_aborts_part_way(self):
+        calls = {"n": 0}
+
+        def cancel():
+            calls["n"] += 1
+            return calls["n"] > 2
+
+        store = _Store()
+        with pytest.raises(InferenceAborted) as exc:
+            _engine(store).run("s4", "owner-1", "faces/s4", 500, 0, cancel=cancel, cancel_every=10)
+
+        # polled at frames 0, 10, 20 -> gone at the third poll
+        assert exc.value.frames_done == 20
+        assert store.seen == list(range(20))
+
+    def test_finishes_when_caller_stays(self):
+        store = _Store()
+        result = _engine(store).run("s5", "owner-1", "faces/s5", 40, 0, cancel=lambda: False)
+
+        assert store.seen == list(range(40))
+        assert result["frames_sampled_out"] == 0

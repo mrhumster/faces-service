@@ -1,8 +1,10 @@
 from fastapi import APIRouter, Header, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from .. import config
 from ..auth import AuthError, internal_token
+from ..infer import InferenceAborted
 from ..metrics import cascade_total, infer_duration, infer_faces_detected, infer_occurrences_written, infer_total
 
 router = APIRouter()
@@ -35,13 +37,22 @@ def infer(body: InferRequest, request: Request, x_internal_token: str | None = H
         raise HTTPException(status_code=503, detail="engine not ready")
 
     with infer_duration.time():
-        result = engine.run(
-            body.stream_id,
-            body.owner_id,
-            body.frames_prefix,
-            body.count,
-            config.Config.max_frames,
-        )
+        try:
+            result = engine.run(
+                body.stream_id,
+                body.owner_id,
+                body.frames_prefix,
+                body.count,
+                config.Config.max_frames,
+                cancel=request.is_disconnected,
+            )
+        except InferenceAborted as aborted:
+            # The worker already gave up; there is nobody left to answer.
+            infer_total.labels(status="499").inc()
+            return JSONResponse(
+                status_code=499,
+                content={"detail": "client gone", "frames_done": aborted.frames_done},
+            )
     infer_faces_detected.inc(result["faces_detected"])
     infer_occurrences_written.inc(result["occurrences_written"])
     infer_total.labels(status="200").inc()

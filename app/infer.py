@@ -14,6 +14,14 @@ logger = logging.getLogger("faces-service")
 SAMPLE_INTERVAL_SECONDS = 5.0
 
 
+class InferenceAborted(Exception):
+    """The caller went away mid-run (worker HTTP timeout). Nothing was written."""
+
+    def __init__(self, frames_done: int) -> None:
+        super().__init__(f"caller gone after {frames_done} frames")
+        self.frames_done = frames_done
+
+
 def frame_indices(count: int, max_frames: int = 0) -> list[int]:
     """Frame indexes to process, subsampled uniformly across the whole video.
 
@@ -45,12 +53,18 @@ class InferEngine:
         frames_prefix: str,
         count: int,
         max_frames: int = 0,
+        cancel=None,
+        cancel_every: int = 10,
     ) -> dict:
         """Reads `count` frames from MinIO under frames_prefix, runs face detection/
         embedding per frame and clusters into this owner's clusters.
 
         `max_frames` caps the work: frames are sampled uniformly across the whole
-        video rather than only its first `max_frames` frames."""
+        video rather than only its first `max_frames` frames.
+
+        `cancel` is polled every `cancel_every` frames; when it reports the caller
+        is gone (worker timed out) the run stops instead of burning CPU on a
+        result nobody will read. Nothing is written in that case."""
         indices = frame_indices(count, max_frames)
         sampled_out = count - len(indices)
         if sampled_out > 0:
@@ -68,7 +82,13 @@ class InferEngine:
         created_ids: list[str] = []
         crops_saved = 0
 
-        for idx in indices:
+        for done, idx in enumerate(indices):
+            if cancel is not None and done % cancel_every == 0 and cancel():
+                logger.info(
+                    "inference aborted, caller gone stream_id=%s after=%d/%d frames",
+                    stream_id, done, len(indices),
+                )
+                raise InferenceAborted(done)
             buf = self.store.get_frame_io(frames_prefix, idx)
             if buf is None:
                 frame_skipped += 1
