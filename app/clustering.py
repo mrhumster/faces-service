@@ -181,18 +181,28 @@ def face_is_large_enough(
 
 SIMILARITY_THRESHOLD = 0.5
 
+# Similarity that renders as "100%" in the UI (the client rounds to whole
+# percents), so a group whose *every* member clears this is an exact duplicate
+# pair that needs no human decision.
+EXACT_DUPLICATE_THRESHOLD = 0.995
+
 
 def build_similarity_groups(clusters: list[dict], threshold: float = SIMILARITY_THRESHOLD):
-    """Group near-duplicate clusters by pairwise centroid cosine similarity
-    (union-find connected components). Mirrors the browser-side implementation
-    so the API never ships overlapping duplicates to the UI.
+    """Group clusters into cliques of mutually similar centroids.
+
+    A greedy clique grows from each unassigned cluster (highest degree /
+    named / most samples first): a candidate joins only if it is >= threshold
+    to *every* member already in the clique. Connected-component grouping used
+    to chain A~B~C into a group where C could be far from the displayed
+    representative (even negative) — this keeps every pair, and therefore
+    every member relative to the rep, at or above the threshold.
 
     Returns a list of groups:
         {"rep": dict, "members": [{"cluster": dict, "sim": float}], "maxSim": float}
-    rep is the named cluster with the largest sample_count (or just the largest
-    sample_count when none are named); members are sorted by similarity to rep
-    descending; groups are ordered by maxSim descending. Clusters without a
-    centroid are ignored. Clusters not part of any edge stay out of the result.
+    rep is the named clique member with the largest sample_count (or just the
+    largest sample_count when none are named); members are sorted by similarity
+    to rep descending; groups are ordered by maxSim descending. Clusters without
+    a centroid, or with no similar peer, stay out of the result.
     """
     with_vec = [c for c in clusters if c.get("centroid")]
     if len(with_vec) < 2:
@@ -205,54 +215,57 @@ def build_similarity_groups(clusters: list[dict], threshold: float = SIMILARITY_
     norms[norms == 0] = 1.0
     centroids = centroids / norms[:, None]
     sims = np.clip(centroids @ centroids.T, -1.0, 1.0)
+    similar = sims >= threshold
+    np.fill_diagonal(similar, False)
 
-    idx = {c["id"]: i for i, c in enumerate(with_vec)}
+    degrees = similar.sum(axis=1)
+    order = sorted(
+        range(len(with_vec)),
+        key=lambda i: (int(degrees[i]), int(with_vec[i]["is_named"]), with_vec[i]["sample_count"]),
+        reverse=True,
+    )
 
-    parent = {c["id"]: c["id"] for c in with_vec}
-
-    def find(x: str) -> str:
-        root = x
-        while parent[root] != root:
-            root = parent[root]
-        while parent[x] != root:
-            nxt = parent[x]
-            parent[x] = root
-            x = nxt
-        return root
-
-    def union(a: str, b: str) -> None:
-        ra, rb = find(a), find(b)
-        if ra != rb:
-            parent[rb] = ra
-
-    for i in range(len(with_vec)):
-        for j in range(i + 1, len(with_vec)):
-            if float(sims[i, j]) >= threshold:
-                union(with_vec[i]["id"], with_vec[j]["id"])
-
-    by_root: dict[str, list[dict]] = {}
-    for c in with_vec:
-        by_root.setdefault(find(c["id"]), []).append(c)
-
-    def member_sim(rep_id: str, c: dict) -> float:
-        return float(sims[idx[rep_id], idx[c["id"]]])
-
+    assigned = np.zeros(len(with_vec), dtype=bool)
     groups = []
-    for members_list in by_root.values():
-        if len(members_list) < 2:
+    for i in order:
+        if assigned[i]:
             continue
+        neighbors = [int(j) for j in np.where(similar[i])[0] if not assigned[j]]
+        if not neighbors:
+            continue
+        neighbors.sort(key=lambda j: float(sims[i, j]), reverse=True)
+        clique = [i]
+        for candidate in neighbors:
+            if all(sims[candidate, member] >= threshold for member in clique):
+                clique.append(candidate)
+        for member in clique:
+            assigned[member] = True
         rep = max(
-            members_list,
-            key=lambda c: (int(c["is_named"]), c["sample_count"]),
+            clique,
+            key=lambda k: (int(with_vec[k]["is_named"]), with_vec[k]["sample_count"]),
         )
         members = [
-            {"cluster": c, "sim": member_sim(rep["id"], c)}
-            for c in members_list
-            if c["id"] != rep["id"]
+            {"cluster": with_vec[k], "sim": float(sims[rep, k])}
+            for k in clique
+            if k != rep
         ]
         members.sort(key=lambda m: m["sim"], reverse=True)
         max_sim = max((m["sim"] for m in members), default=0.0)
-        groups.append({"rep": rep, "members": members, "maxSim": max_sim})
+        groups.append({"rep": with_vec[rep], "members": members, "maxSim": max_sim})
 
     groups.sort(key=lambda g: g["maxSim"], reverse=True)
     return groups
+
+
+def select_exact_duplicate_groups(
+    groups: list[dict], threshold: float = EXACT_DUPLICATE_THRESHOLD
+) -> list[dict]:
+    """Groups whose every member is >= threshold: identity is not in question,
+    so merging them needs no human decision. The default threshold is what the
+    UI renders as "100%". A group with even one weaker member is left for the
+    user (it is exactly the case where a decision is required)."""
+    return [
+        g
+        for g in groups
+        if g["members"] and all(m["sim"] >= threshold for m in g["members"])
+    ]

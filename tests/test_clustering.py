@@ -147,6 +147,89 @@ def test_build_similarity_groups_no_group_for_two_unrelated():
     assert clustering.build_similarity_groups(clusters, 0.5) == []
 
 
+def test_build_similarity_groups_does_not_chain():
+    # p~q and q~r (0.6 each) but p vs r is negative: the old connected-component
+    # grouping produced {p, q, r} with r far below threshold from the rep.
+    clusters = [
+        _cluster("p", [1.0, 0.0, 0.0], is_named=True, name="A"),
+        _cluster("q", [0.6, 0.8, 0.0]),
+        _cluster("r", [-0.28, 0.96, 0.0]),
+    ]
+    groups = clustering.build_similarity_groups(clusters, 0.5)
+    assert len(groups) == 1
+    grouped = {g["rep"]["id"] for g in groups}
+    grouped |= {m["cluster"]["id"] for g in groups for m in g["members"]}
+    assert "r" not in grouped
+    for g in groups:
+        assert all(m["sim"] >= 0.5 for m in g["members"])
+
+
+def test_build_similarity_groups_generic_hub_is_limited():
+    # hub is >= 0.5 to a / b / c, but the neighbours are mutually dissimilar;
+    # a clique must not let the hub merge them all.
+    clusters = [
+        _cluster("hub", [1.0, 0.0, 0.0]),
+        _cluster("a", [0.5, 0.866, 0.0]),
+        _cluster("b", [0.5, -0.866, 0.0]),
+        _cluster("c", [0.5, 0.0, 0.866]),
+    ]
+    groups = clustering.build_similarity_groups(clusters, 0.5)
+    assert len(groups) == 1
+    assert len(groups[0]["members"]) == 1
+    for g in groups:
+        for m in g["members"]:
+            assert m["sim"] >= 0.5
+
+
+def test_build_similarity_groups_chain_never_under_threshold():
+    import math
+
+    # Six centroids spaced 53 degrees apart: neighbours are ~0.60 similar,
+    # anything two steps away is negative. Chaining would collapse all six;
+    # cliques must keep every member >= 0.5 from its rep.
+    clusters = [
+        _cluster(f"k{i}", [math.cos(math.radians(53 * i)), math.sin(math.radians(53 * i)), 0.0])
+        for i in range(6)
+    ]
+    groups = clustering.build_similarity_groups(clusters, 0.5)
+    grouped = set()
+    for g in groups:
+        grouped.add(g["rep"]["id"])
+        for m in g["members"]:
+            assert m["sim"] >= 0.5
+            grouped.add(m["cluster"]["id"])
+    assert grouped == {f"k{i}" for i in range(6)}
+
+
+def test_select_exact_duplicate_groups_only_fully_identical():
+    groups = [
+        {"rep": {"id": "a"}, "members": [{"cluster": {"id": "b"}, "sim": 0.999}], "maxSim": 0.999},
+        {
+            "rep": {"id": "c"},
+            "members": [
+                {"cluster": {"id": "d"}, "sim": 0.999},
+                {"cluster": {"id": "e"}, "sim": 0.55},
+            ],
+            "maxSim": 0.999,
+        },
+        {"rep": {"id": "f"}, "members": [{"cluster": {"id": "g"}, "sim": 0.995}], "maxSim": 0.995},
+        {"rep": {"id": "h"}, "members": [], "maxSim": 0.0},
+    ]
+    selected = clustering.select_exact_duplicate_groups(groups, 0.995)
+    assert [g["rep"]["id"] for g in selected] == ["a", "f"]
+
+
+def test_select_exact_duplicate_groups_default_is_hundred_percent():
+    groups = [
+        {"rep": {"id": "keep"}, "members": [{"cluster": {"id": "x"}, "sim": 0.995}], "maxSim": 0.995},
+        {"rep": {"id": "drop"}, "members": [{"cluster": {"id": "y"}, "sim": 0.994}], "maxSim": 0.994},
+    ]
+    selected = clustering.select_exact_duplicate_groups(groups)
+    assert [g["rep"]["id"] for g in selected] == ["keep"]
+
+
+
+
 # --- interactive frame assist -------------------------------------------------
 # The paused-frame assist must *offer* the nearest identity even when it is below
 # the batch match/unknown thresholds, and must stay silent when nothing is close.

@@ -1,6 +1,7 @@
 import logging
 import threading
 import time
+from typing import Literal
 
 import cv2
 import numpy as np
@@ -11,13 +12,17 @@ from pydantic import BaseModel, Field
 from .. import config, db
 from ..auth import AuthContext, AuthError, authorized, ensure_owner
 from ..clustering import (
+    EXACT_DUPLICATE_THRESHOLD,
     SUGGESTION_INDEX,
     best_match,
     build_suggestion_index,
     build_similarity_groups,
+    cosine_similarity,
     iou,
     merge_centroid,
+    select_exact_duplicate_groups,
 )
+from ..infer import SAMPLE_INTERVAL_SECONDS
 from ..metrics import reader_requests
 
 router = APIRouter()
@@ -41,8 +46,26 @@ class BatchDeleteBody(BaseModel):
     cluster_ids: list[str] = Field(min_length=1, max_length=100)
 
 
+class MergeDuplicatesBody(BaseModel):
+    min_similarity: float | None = Field(default=None, ge=0.9, le=1.0)
+
+
+class SampleCropBody(BaseModel):
+    stream_id: str
+    t_seconds: float = Field(ge=0)
+
+
+class SearchVideosBody(BaseModel):
+    cluster_ids: list[str] = Field(min_length=1, max_length=100)
+    mode: Literal["all", "any"] = "all"
+
+
 def _auth(authorization: str | None = Header(None)) -> AuthContext:
     return authorized(authorization)
+
+
+LIST_FACES_SORT_FIELDS = {"name", "samples", "added"}
+LIST_FACES_ORDERS = {"asc", "desc"}
 
 
 @router.get("/faces")
@@ -50,14 +73,28 @@ def list_faces(
     auth: AuthContext = Depends(_auth),
     limit: int = Query(default=LIST_FACES_DEFAULT_LIMIT, ge=1, le=LIST_FACES_MAX_LIMIT),
     offset: int = Query(default=0, ge=0),
+    sort: str = Query(default="name"),
+    order: str | None = Query(default=None),
 ):
     """People list. Clusters with 0 videos (orphans) are hidden and counted in
-    ``empty_count``; the rest (``clusters``) is paginated by samples. Similarity
-    groups (near-duplicates by centroid cosine >= 0.5) are computed server-side
-    and returned in full on every page; grouped clusters are excluded from the
-    flat list. ``total`` is the number of video-bearing clusters, ``rest_total``
-    the number of non-grouped ones (the pagination bound). Centroid vectors are
-    stripped from list responses to keep the payload small."""
+    ``empty_count``; the rest (``clusters``) is paginated. Similarity groups
+    (cliques of mutually similar centroids, every pair cosine >= 0.5) are
+    computed server-side and returned in full on every page; grouped clusters
+    are excluded from the flat list. ``total`` is the number of video-bearing
+    clusters, ``rest_total`` the number of non-grouped ones (the pagination
+    bound). Centroid vectors are stripped from list responses to keep the
+    payload small.
+
+    ``sort`` is one of name|samples|added; ``order`` defaults to asc for name
+    and desc for samples/added. Named clusters are always pinned on top — the
+    chosen sort only reorders within the named and unnamed sections."""
+    if sort not in LIST_FACES_SORT_FIELDS:
+        raise HTTPException(status_code=400, detail="invalid sort")
+    if order is None:
+        order = "asc" if sort == "name" else "desc"
+    elif order not in LIST_FACES_ORDERS:
+        raise HTTPException(status_code=400, detail="invalid order")
+
     owner_id = auth.user_id
     clusters = db.get_clusters_for_owner(owner_id)
     videos_by_cluster = db.get_clusters_videos(owner_id)
@@ -76,16 +113,25 @@ def list_faces(
         g["rep"]["id"] for g in all_groups
     } | {m["cluster"]["id"] for g in all_groups for m in g["members"]}
 
-    flat = [c for c in rest if c["id"] not in grouped_ids]
-    flat.sort(
-        key=lambda c: (
-            not c["is_named"],
-            c["name"] is None,
-            c["name"] or "",
-            -c["sample_count"],
-            c["id"],
-        )
-    )
+    # Similarity groups hide their members from the flat list, but a *named*
+    # person must never disappear from People just because a look-alike cluster
+    # (usually anonymous) got grouped with it — keep named clusters in `flat`.
+    flat = [c for c in rest if c["id"] not in grouped_ids or c["is_named"]]
+
+    def _flat_key(c):
+        if sort == "samples":
+            return (c["sample_count"], c["id"])
+        if sort == "added":
+            return (c["created_at"], c["id"])
+        return (c["name"] is None, c["name"] or "", c["id"])
+
+    # Named clusters always lead; the sort applies within each section.
+    reverse = order == "desc"
+    named = [c for c in flat if c["is_named"]]
+    unnamed = [c for c in flat if not c["is_named"]]
+    named.sort(key=_flat_key, reverse=reverse)
+    unnamed.sort(key=_flat_key, reverse=reverse)
+    flat = named + unnamed
 
     total = len(rest)
     rest_total = len(flat)
@@ -122,6 +168,22 @@ def list_faces(
         "limit": limit,
         "offset": offset,
     }
+
+
+@router.post("/faces/videos")
+def search_videos_by_faces(
+    body: SearchVideosBody, auth: AuthContext = Depends(_auth)
+):
+    """Videos (owner-scoped) that contain the selected persons.
+
+    ``mode='all'`` requires every selected cluster to appear in the video,
+    ``mode='any'`` only one. Returns the raw distinct-cluster and frame counts
+    per stream; the caller joins the stream metadata itself.
+    """
+    cluster_ids = list(dict.fromkeys(body.cluster_ids))
+    streams = db.get_streams_for_clusters(auth.user_id, cluster_ids, body.mode)
+    reader_requests.labels(endpoint="search_faces_videos", status="200").inc()
+    return {"streams": streams, "total": len(streams), "mode": body.mode}
 
 
 @router.post("/faces/delete-empty")
@@ -174,6 +236,70 @@ def delete_faces_batch(
     return {"deleted": deleted}
 
 
+@router.post("/faces/merge-duplicates")
+def merge_duplicate_groups(
+    request: Request,
+    auth: AuthContext = Depends(_auth),
+    body: MergeDuplicatesBody | None = None,
+):
+    """Merge every similarity group that is an exact duplicate: all members are
+    >= the threshold (0.995 by default, what the UI renders as "100%"). Such a
+    group has a certain answer — it is the same person — so the whole set is
+    collapsed without a human decision; the People UI exposes this as one button.
+
+    Each group merges into its named member (otherwise the representative), the
+    source crops are purged, and a failure on one group does not abort the rest.
+    Returns how many groups/clusters were merged and how many groups failed."""
+    threshold = (
+        body.min_similarity
+        if body is not None and body.min_similarity is not None
+        else EXACT_DUPLICATE_THRESHOLD
+    )
+    owner_id = auth.user_id
+    clusters = db.get_clusters_for_owner(owner_id)
+    videos_by_cluster = db.get_clusters_videos(owner_id)
+    rest = [c for c in clusters if c["id"] in videos_by_cluster]
+    groups = build_similarity_groups([c for c in rest if c.get("centroid")])
+    exact = select_exact_duplicate_groups(groups, threshold)
+
+    store = getattr(request.app.state, "store", None)
+    groups_merged = 0
+    clusters_merged = 0
+    failures = 0
+    for group in exact:
+        members = [group["rep"]] + [m["cluster"] for m in group["members"]]
+        ids = [c["id"] for c in members]
+        target = next((c["id"] for c in members if c["is_named"]), ids[0])
+        sources = [cid for cid in ids if cid != target]
+        try:
+            result = db.merge_clusters(owner_id, target, sources)
+        except Exception as e:
+            failures += 1
+            logger.warning("merge-duplicates error target=%s: %s", target, e)
+            continue
+        if result is None:
+            failures += 1
+            continue
+        groups_merged += 1
+        clusters_merged += len(ids)
+        if store is not None:
+            for cid in result.get("deleted_cluster_ids") or []:
+                try:
+                    store.delete_crop(owner_id, cid)
+                except Exception as e:
+                    logger.warning(
+                        "crop delete during merge-duplicates error cluster=%s: %s",
+                        cid,
+                        e,
+                    )
+    reader_requests.labels(endpoint="merge_duplicates", status="200").inc()
+    return {
+        "groups_merged": groups_merged,
+        "clusters_merged": clusters_merged,
+        "failures": failures,
+    }
+
+
 @router.get("/faces/suggest")
 def suggest_faces(
     auth: AuthContext = Depends(_auth),
@@ -204,6 +330,74 @@ def _engine_or_503(request: Request, endpoint: str):
         reader_requests.labels(endpoint=endpoint, status="503").inc()
         raise HTTPException(status_code=503, detail="engine not ready")
     return engine
+
+
+# Cosine floor between a re-detected face and the occurrence's stored embedding.
+# The two come from the same frame, so the correct face scores ~1.0; the floor
+# only guards against a frame where the face was not re-detected at all.
+SAMPLE_MATCH_FLOOR = 0.4
+
+
+def _sample_frame_index(t_seconds: float) -> int:
+    """Frame index whose sample the occurrence was detected on.
+
+    The batch pipeline samples every SAMPLE_INTERVAL_SECONDS and records
+    t_seconds = (idx + 0.5) * interval (infer.py), so the index is invertible.
+    Occurrences created by the paused-frame assist carry an arbitrary t_seconds;
+    for those the index is a best-effort (the nearest sample)."""
+    return int(round(t_seconds / SAMPLE_INTERVAL_SECONDS - 0.5))
+
+
+def _render_sample_crop(
+    request: Request, cluster: dict, stream_id: str, t_seconds: float, endpoint: str = "face_sample_crop"
+) -> bytes | None:
+    """Rebuild a face crop for one stored occurrence.
+
+    Per-sample crops are not persisted (only the cluster's single crop is), and
+    the occurrence row has no bbox — so the sampled frame the occurrence was
+    detected on is fetched from MinIO and the detector is re-run. The face is
+    picked by similarity to the occurrence's own stored embedding, which is far
+    more precise than the drifting cluster centroid. Returns None when the frame
+    is gone or no face re-detects (the UI simply hides that sample)."""
+    if t_seconds < 0:
+        return None
+    idx = _sample_frame_index(t_seconds)
+    if idx < 0:
+        return None
+    store = getattr(request.app.state, "store", None)
+    engine = _engine_or_503(request, endpoint)
+    occ = db.get_cluster_occurrence(cluster["id"], stream_id, t_seconds)
+    if occ is None:
+        return None
+    raw = store.get_frame(f"faces/{stream_id}", idx) if store is not None else None
+    if raw is None:
+        return None
+    img = _decode_image(raw)
+    if img is None:
+        return None
+
+    target = np.asarray(occ["embedding"], dtype=np.float32)
+    with _INFER_SEMAPHORE:
+        detections = engine.model.embed(
+            img,
+            config.Config.detect_threshold,
+            config.Config.assist_det_size,
+            config.Config.assist_min_face_ratio,
+        )
+
+    best = None
+    best_sim = SAMPLE_MATCH_FLOOR
+    for det in detections:
+        bbox = det.get("bbox")
+        if not bbox:
+            continue
+        sim = cosine_similarity(np.asarray(det["embedding"], dtype=np.float32), target)
+        if sim >= best_sim:
+            best_sim = sim
+            best = det
+    if best is None:
+        return None
+    return engine._crop_jpeg(img, best["bbox"])
 
 
 def _public_cluster(c: dict) -> dict:
@@ -540,6 +734,80 @@ async def replace_face_crop(
 
     updated = db.get_cluster(cluster_id)
     reader_requests.labels(endpoint="replace_face_crop", status="200").inc()
+    return {"cluster": updated, "crop_object": key}
+
+
+@router.get("/faces/{cluster_id}/samples/{stream_id}/crop")
+def face_sample_crop(
+    cluster_id: str,
+    stream_id: str,
+    request: Request,
+    t_seconds: float = Query(..., ge=0),
+    auth: AuthContext = Depends(_auth),
+):
+    """Render the face crop of one stored occurrence, rebuilt on the fly from
+    the sampled frame. Served as a thumbnail the owner can pick from when
+    replacing a person's picture (owner/admin only)."""
+    c = db.get_cluster(cluster_id)
+    if c is None:
+        reader_requests.labels(endpoint="face_sample_crop", status="404").inc()
+        raise HTTPException(status_code=404, detail="not found")
+    try:
+        ensure_owner(auth, c["owner_id"])
+    except AuthError as e:
+        reader_requests.labels(endpoint="face_sample_crop", status=str(e.status)).inc()
+        raise HTTPException(status_code=e.status, detail=e.message)
+
+    jpeg = _render_sample_crop(request, c, stream_id, t_seconds)
+    if jpeg is None:
+        reader_requests.labels(endpoint="face_sample_crop", status="404").inc()
+        raise HTTPException(status_code=404, detail="no sample image")
+    reader_requests.labels(endpoint="face_sample_crop", status="200").inc()
+    return Response(
+        content=jpeg,
+        media_type="image/jpeg",
+        headers={"Cache-Control": "private, max-age=3600"},
+    )
+
+
+@router.put("/faces/{cluster_id}/crop/from-sample")
+def replace_face_crop_from_sample(
+    cluster_id: str,
+    body: SampleCropBody,
+    request: Request,
+    auth: AuthContext = Depends(_auth),
+):
+    """Set the cluster's crop from one of its own samples (owner/admin only).
+
+    Mirrors the multipart ``PUT /faces/{id}/crop`` but takes a stored occurrence
+    instead of an upload; the crop is rebuilt server-side and persisted."""
+    c = db.get_cluster(cluster_id)
+    if c is None:
+        reader_requests.labels(endpoint="replace_face_crop_from_sample", status="404").inc()
+        raise HTTPException(status_code=404, detail="not found")
+    try:
+        ensure_owner(auth, c["owner_id"])
+    except AuthError as e:
+        reader_requests.labels(endpoint="replace_face_crop_from_sample", status=str(e.status)).inc()
+        raise HTTPException(status_code=e.status, detail=e.message)
+
+    store = getattr(request.app.state, "store", None)
+    if store is None:
+        reader_requests.labels(endpoint="replace_face_crop_from_sample", status="503").inc()
+        raise HTTPException(status_code=503, detail="storage unavailable")
+
+    jpeg = _render_sample_crop(
+        request, c, body.stream_id, body.t_seconds, endpoint="replace_face_crop_from_sample"
+    )
+    if jpeg is None:
+        reader_requests.labels(endpoint="replace_face_crop_from_sample", status="404").inc()
+        raise HTTPException(status_code=404, detail="no sample image")
+
+    key = store.put_crop(c["owner_id"], cluster_id, jpeg, content_type="image/jpeg")
+    db.set_cluster_crop(cluster_id, c["owner_id"], key)
+
+    updated = db.get_cluster(cluster_id)
+    reader_requests.labels(endpoint="replace_face_crop_from_sample", status="200").inc()
     return {"cluster": updated, "crop_object": key}
 
 

@@ -239,6 +239,46 @@ def get_clusters_videos(owner_id: str) -> dict[str, list[dict]]:
         return out
 
 
+def get_streams_for_clusters(
+    owner_id: str, cluster_ids: list[str], mode: str = "all"
+) -> list[dict]:
+    """Videos containing the given clusters (owner-scoped).
+
+    ``mode='all'`` keeps only streams where every cluster occurs; ``mode='any'``
+    keeps streams with at least one. Ordered by how many of the requested
+    clusters matched, then by total frames, newest-independent (stream id) so
+    the result is stable. ``persons`` is the distinct-cluster count, ``frames``
+    the raw occurrence count.
+    """
+    ids = list(dict.fromkeys(cluster_ids))
+    if not ids:
+        return []
+    threshold = len(ids) if mode == "all" else 1
+    with conn() as cur:
+        cur.execute(
+            """
+            SELECT stream_id,
+                   count(DISTINCT cluster_id) AS persons,
+                   count(*)                   AS frames
+            FROM face_occurrences
+            WHERE owner_id = %s AND cluster_id = ANY(%s::uuid[])
+            GROUP BY stream_id
+            HAVING count(DISTINCT cluster_id) >= %s
+            ORDER BY persons DESC, frames DESC, stream_id
+            """,
+            (owner_id, ids, threshold),
+        )
+        rows = cur.fetchall()
+    return [
+        {
+            "stream_id": str(r["stream_id"]),
+            "persons": int(r["persons"]),
+            "frames": int(r["frames"]),
+        }
+        for r in rows
+    ]
+
+
 def get_clusters_without_occurrences(owner_id: str) -> list[dict]:
     """Clusters that appear in no video (orphans with 0 samples)."""
     with conn() as cur:
@@ -283,6 +323,29 @@ def get_cluster_occurrences(cluster_id: str) -> list[dict]:
             }
             for r in cur.fetchall()
         ]
+
+
+def get_cluster_occurrence(
+    cluster_id: str, stream_id: str, t_seconds: float
+) -> dict | None:
+    """The stored embedding of one (cluster, stream, t) occurrence, used to pick
+    the right face out of a re-detected frame when rebuilding a sample crop."""
+    with conn() as cur:
+        cur.execute(
+            """
+            SELECT embedding, confidence
+            FROM face_occurrences
+            WHERE cluster_id = %s::uuid AND stream_id = %s::uuid AND t_seconds = %s
+            """,
+            (cluster_id, stream_id, t_seconds),
+        )
+        r = cur.fetchone()
+    if r is None:
+        return None
+    return {
+        "embedding": _from_list_array(r["embedding"]),
+        "confidence": float(r["confidence"]),
+    }
 
 
 def get_occurrences_for_stream(stream_id: str) -> list[dict]:
