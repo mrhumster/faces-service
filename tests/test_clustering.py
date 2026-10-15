@@ -201,6 +201,35 @@ def test_build_similarity_groups_chain_never_under_threshold():
     assert grouped == {f"k{i}" for i in range(6)}
 
 
+def test_build_similarity_groups_never_combines_two_named():
+    # Two named people whose centroids match are similar by every pairwise
+    # measure, but a group is a merge suggestion: the service must never offer
+    # to merge two named people. The second named stays out of the group.
+    clusters = [
+        _cluster("nikodim", [1.0, 0.0, 0.0], is_named=True, sample_count=74, name="Nikodim"),
+        _cluster("mark", [1.0, 0.0, 0.0], is_named=True, sample_count=55, name="Mark"),
+        _cluster("anon", [1.0, 0.0, 0.0]),
+    ]
+    groups = clustering.build_similarity_groups(clusters, 0.5)
+    for g in groups:
+        members = [g["rep"]] + [m["cluster"] for m in g["members"]]
+        assert sum(c["is_named"] for c in members) <= 1
+    # The anonymous follower is still suggested against exactly one named rep.
+    assert len(groups) == 1
+    assert groups[0]["rep"]["is_named"] is True
+    assert [m["cluster"]["id"] for m in groups[0]["members"]] == ["anon"]
+
+
+def test_build_similarity_groups_two_named_alone_make_no_group():
+    # With nothing but two matching named clusters there is no one to merge
+    # into, so no group (and no merge suggestion) is produced at all.
+    clusters = [
+        _cluster("nikodim", [1.0, 0.0, 0.0], is_named=True, name="Nikodim"),
+        _cluster("mark", [1.0, 0.0, 0.0], is_named=True, name="Mark"),
+    ]
+    assert clustering.build_similarity_groups(clusters, 0.5) == []
+
+
 def test_select_exact_duplicate_groups_only_fully_identical():
     groups = [
         {"rep": {"id": "a"}, "members": [{"cluster": {"id": "b"}, "sim": 0.999}], "maxSim": 0.999},

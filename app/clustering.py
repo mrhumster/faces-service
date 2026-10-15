@@ -197,6 +197,10 @@ def build_similarity_groups(clusters: list[dict], threshold: float = SIMILARITY_
     representative (even negative) — this keeps every pair, and therefore
     every member relative to the rep, at or above the threshold.
 
+    A clique holds at most one *named* cluster: a group is a merge suggestion,
+    and two named people must never be suggested for merging (the second named
+    candidate is left unassigned so it can seed its own clique).
+
     Returns a list of groups:
         {"rep": dict, "members": [{"cluster": dict, "sim": float}], "maxSim": float}
     rep is the named clique member with the largest sample_count (or just the
@@ -235,9 +239,19 @@ def build_similarity_groups(clusters: list[dict], threshold: float = SIMILARITY_
             continue
         neighbors.sort(key=lambda j: float(sims[i, j]), reverse=True)
         clique = [i]
+        clique_has_named = bool(with_vec[i]["is_named"])
         for candidate in neighbors:
+            # Never suggest merging two named people: a second named candidate
+            # is skipped (left unassigned) so it can seed its own clique.
+            if with_vec[candidate]["is_named"] and clique_has_named:
+                continue
             if all(sims[candidate, member] >= threshold for member in clique):
                 clique.append(candidate)
+                clique_has_named = clique_has_named or bool(
+                    with_vec[candidate]["is_named"]
+                )
+        if len(clique) < 2:
+            continue
         for member in clique:
             assigned[member] = True
         rep = max(
